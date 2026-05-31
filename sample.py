@@ -24,6 +24,9 @@ class GenerationParams:
     """Arguments for handwriting generation/sampling"""
     temperature: float = 1.0
     top_k: bool = None
+    top_p: float = 0.95            # nucleus sampling; set to None/1.0 to disable
+    guidance_scale: float = 1.0    # classifier-free guidance; >1 sharpens text adherence
+    structured: bool = True        # mask out tokens that violate the (theta, r) pair structure
     do_sample: bool = False
     num_steps: int = 1050
     warmup_steps: int = 50
@@ -67,13 +70,63 @@ def plot_strokes(stroke, title, fig=None, ax=None, figsize=(12, 2), dpi=150, lin
     return fig, ax
 
 
+def _structured_mask(idx, dataset):
+    """Boolean (B, vocab) mask of tokens that are VALID as the next token, given the
+    (theta, r) pairing of the stroke encoding. Strokes are emitted as theta then r;
+    WORD_TOKENs come in pairs and don't change parity. When the current pair is
+    incomplete (parity odd) only r-tokens are allowed; otherwise theta / WORD / END."""
+    n_r = len(dataset.r_bins)
+    n_theta = len(dataset.theta_bins)
+    r_lo, r_hi = dataset.cumulative_sizes[0], dataset.cumulative_sizes[0] + n_r
+    th_lo, th_hi = dataset.cumulative_sizes[1], dataset.cumulative_sizes[1] + n_theta
+    vocab = dataset.get_vocab_size()
+    device = idx.device
+
+    is_stroke = (((idx >= r_lo) & (idx < r_hi)) | ((idx >= th_lo) & (idx < th_hi)))
+    parity = is_stroke.sum(dim=1) % 2  # 0 -> expect theta, 1 -> expect r
+
+    ar = torch.arange(vocab, device=device)
+    theta_tok = (ar >= th_lo) & (ar < th_hi)
+    r_tok = (ar >= r_lo) & (ar < r_hi)
+    specials = torch.zeros(vocab, dtype=torch.bool, device=device)
+    specials[[dataset.WORD_TOKEN, dataset.END_TOKEN]] = True
+
+    expect_theta = (theta_tok | specials).unsqueeze(0)  # (1, vocab)
+    expect_r = r_tok.unsqueeze(0)
+    return torch.where((parity == 0).unsqueeze(1), expect_theta, expect_r)
+
+
+def _filter_logits(logits, temperature, top_k, top_p):
+    logits = logits / max(temperature, 1e-6)
+    if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float('Inf')
+    if top_p is not None and 0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        cum = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        remove = cum - F.softmax(sorted_logits, dim=-1) > top_p  # keep tokens up to and incl. the one crossing top_p
+        remove[:, 0] = False
+        scatter_remove = torch.zeros_like(remove).scatter(1, sorted_idx, remove)
+        logits = logits.masked_fill(scatter_remove, -float('Inf'))
+    return logits
+
+
 @torch.no_grad()
-def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=False,
+             top_k=None, top_p=None, guidance_scale=1.0, structured=False, dataset=None):
     """
     Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
     the sequence max_new_tokens times, feeding the predictions back into the model each time.
-    Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+    Supports nucleus sampling (top_p), classifier-free guidance (guidance_scale > 1), and
+    structured masking that forbids tokens which would break the (theta, r) pairing.
+    Make sure the model is in eval() mode.
     """
+    if hasattr(model, 'configure_subnetwork'):
+        model.configure_subnetwork('xl')  # always sample from the full model
+
+    use_cfg = guidance_scale is not None and guidance_scale != 1.0
+    null_context = torch.zeros_like(context) if use_cfg else None  # all-PAD == unconditional
+
     block_size = model.get_block_size()
     steps = max(0, max_new_tokens-idx.size(1))
     for i in range(steps):
@@ -81,14 +134,20 @@ def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=Fal
         idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
         # forward the model to get the logits for the index in the sequence
         logits, _ = model(idx_cond, context)
-        # pluck the logits at the final step and scale by desired temperature
-        logits = logits[:, -1, :] / temperature
-        # optionally crop the logits to only the top k options
-        if top_k is not None:
-            v, _ = torch.topk(logits, top_k)
-            logits[logits < v[:, [-1]]] = -float('Inf')
-        # apply softmax to convert logits to (normalized) probabilities
+        logits = logits[:, -1, :]
+
+        if use_cfg:  # extrapolate away from the unconditional distribution
+            uncond_logits, _ = model(idx_cond, null_context)
+            uncond_logits = uncond_logits[:, -1, :]
+            logits = uncond_logits + guidance_scale * (logits - uncond_logits)
+
+        if structured and dataset is not None:  # forbid structure-violating tokens
+            valid = _structured_mask(idx, dataset)
+            logits = logits.masked_fill(~valid, -float('Inf'))
+
+        logits = _filter_logits(logits, temperature, top_k, top_p)
         probs = F.softmax(logits, dim=-1)
+
         # either sample from the distribution or take the most likely element
         if do_sample:
             idx_next = torch.multinomial(probs, num_samples=1)
@@ -112,10 +171,11 @@ def save_samples(model, dataset, num=2, model_device='cpu', warmup_steps=50, do_
 
     X_init = torch.stack(stroke_seq).to(model_device)[:,:warmup_steps]
     context = torch.stack(context).long().to(model_device)
-    top_k = None
     steps = dataset.get_stroke_seq_length() - 1  # -1 because we already start with the first token
 
-    X_samp = generate(model, X_init, context, steps, top_k=top_k, do_sample=do_sample).to('cpu')
+    X_samp = generate(model, X_init, context, steps, temperature=params.temperature,
+                      top_k=params.top_k, top_p=params.top_p, guidance_scale=params.guidance_scale,
+                      structured=params.structured, dataset=dataset, do_sample=do_sample).to('cpu')
 
     for i in range(X_samp.size(0)):
         # get the i'th row of sampled integers, as python list
@@ -173,7 +233,8 @@ def generate_helper_fn(model, dataset, word_list, params):
 
     steps = params.num_steps - X_init.size(1)
     X_samp = generate(model, X_init, context, steps, temperature=params.temperature,
-                      top_k=params.top_k, do_sample=params.do_sample).to('cpu')
+                      top_k=params.top_k, top_p=params.top_p, guidance_scale=params.guidance_scale,
+                      structured=params.structured, dataset=dataset, do_sample=params.do_sample).to('cpu')
 
     stroke_seq = X_samp[0].detach().cpu().numpy()[warmup_steps:]
     offset_samp = dataset.decode_stroke(stroke_seq)

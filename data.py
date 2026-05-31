@@ -280,16 +280,18 @@ class StrokeDataset(Dataset):
                               for i in range(len(word_strokes)) ]
         encoded_stroke = self.concat_with_word_tokens(encoded_words)
 
-        # Create input and target sequences
+        # Create input and target sequences. Inputs are padded with PAD_TOKEN; targets
+        # are padded with -1 so the loss IGNORES the padded tail (otherwise 30-50% of
+        # every loss is "predict PAD", which badly dilutes the gradient signal).
         x = torch.full((self.max_seq_length,), self.PAD_TOKEN, dtype=torch.long)
-        y = torch.full((self.max_seq_length,), self.PAD_TOKEN, dtype=torch.long)
+        y = torch.full((self.max_seq_length,), -1, dtype=torch.long)
 
         seq_len = min(len(encoded_stroke), self.max_seq_length - 1)  # -1 to leave room for END token
         x[:seq_len] = torch.tensor(encoded_stroke[:seq_len], dtype=torch.long)
         x[seq_len] = self.END_TOKEN
 
         y[:seq_len] = x[1:seq_len+1]
-        y[seq_len] = self.END_TOKEN
+        y[seq_len] = self.END_TOKEN  # predict END after the last real token; rest stays -1 (ignored)
 
         c = self.encode_text(text)
         return x, c, y

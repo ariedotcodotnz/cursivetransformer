@@ -1,4 +1,6 @@
 # Sam Greydanus | 2024
+# 2026 modernization: RoPE, RMSNorm, SwiGLU, fused SDPA (FlashAttention),
+# fused SDPA QK-norm, cross-attention padding masks, and classifier-free guidance (CFG).
 
 ########## IMPORTS AND A FEW GLOBAL VARIABLES ##########
 
@@ -38,7 +40,12 @@ def get_all_args(use_argparse=True):
         'downsample_mean': (0.65, float, 'Mean amount to downsample stroke points (0.65=65%)'),
         'downsample_width': (0.1, float, 'Width of the uniform distribution (0.1=10%)'),
         'add_digits': (True, 'store_true', 'Add digit words to the word bank'),
-        'alphabet': (" enaitoshrdx.vpukbgfcymzw1lqj804I92637OTAS5N)EHR\"\'(BCQLMWYU,ZF!DXV?KPGJ", str, 
+        # --- 2026 additions ---
+        'cond_drop_prob': (0.1, float, 'Prob. of dropping the ASCII condition during training (enables classifier-free guidance)'),
+        'subnetwork_mode': ('full', str, "MatFormer training granularity: 'full' (always xl, best single-model quality), "
+                                          "'random' (stochastic MatFormer for elastic inference), or a fixed flag s/m/l/xl"),
+        'dropout': (0.0, float, 'Dropout probability inside the Transformer blocks'),
+        'alphabet': (" enaitoshrdx.vpukbgfcymzw1lqj804I92637OTAS5N)EHR\"\'(BCQLMWYU,ZF!DXV?KPGJ", str,
                         'All the characters that this model will be able to draw'),
         'dataset_name': ('bigeasybank', str, 'The name of the .zip file containing your dataset'),
         'wandb_project': ('bigbank_experiments', str, 'W&B project name'),
@@ -101,13 +108,13 @@ def get_checkpoint(args, sample_only):
             artifact_dir = artifact.download()
             checkpoint = torch.load(os.path.join(artifact_dir, "best_checkpoint.pt"), weights_only=True)
             model.load_state_dict(checkpoint['model_state_dict'])
-            
+
             if not sample_only:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 step = checkpoint['step'] + 1
                 best_loss = checkpoint['best_loss']
-            
+
             save_checkpoint(model, args.local_checkpoint_path, optimizer, scheduler, step, best_loss)
         else:
             print("No local model or W&B run ID provided. Exiting.")
@@ -147,224 +154,274 @@ def save_checkpoint(model, path, optimizer=None, scheduler=None, step=None, best
     torch.save(checkpoint, path)
 
 
-########## MAIN MODEL DEFINITION ##########
+########## MODERN TRANSFORMER COMPONENTS ##########
 
 
-class NewGELU(nn.Module):
-    """
-    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
-    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
-    """
+class RMSNorm(nn.Module):
+    """Root-mean-square LayerNorm (Zhang & Sennrich 2019). Cheaper and more stable
+    than LayerNorm; the current standard in LLaMA-style transformers."""
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
     def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.to(dtype)) * self.weight
+
+
+def build_rope_cache(seq_len, head_dim, device, dtype, base=10000.0):
+    """Precompute rotary positional embedding (Su et al. 2021, RoFormer) cos/sin tables."""
+    assert head_dim % 2 == 0, "RoPE requires an even head dimension"
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, inv_freq)               # (T, head_dim/2)
+    emb = torch.cat((freqs, freqs), dim=-1)        # (T, head_dim)
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+def apply_rope(x, cos, sin):
+    """Apply rotary embeddings to a (B, n_head, T, head_dim) tensor."""
+    T = x.size(-2)
+    cos = cos[:T].view(1, 1, T, -1)
+    sin = sin[:T].view(1, 1, T, -1)
+    x1, x2 = x.chunk(2, dim=-1)
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return x * cos + rotated * sin
+
 
 class CausalSelfAttention(nn.Module):
-    """
-    A vanilla multi-head masked self-attention layer with a projection at the end.
-    It is possible to use torch.nn.MultiheadAttention here but I am including an
-    explicit implementation here to show that there is nothing too scary here.
-    """
+    """Causal multi-head self-attention with RoPE, QK-norm, and fused
+    scaled_dot_product_attention (FlashAttention when available)."""
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_ctx_head == 0
-        # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_ctx_head
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_ctx_head
+        self.dropout = getattr(config, 'dropout', 0.0)
+        # QK-norm stabilizes training at the high LR (1e-2) this model uses.
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    def forward(self, x, rope):
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        cos, sin = rope
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True,
+            dropout_p=self.dropout if self.training else 0.0)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
 
-        # output projection
-        y = self.c_proj(y)
-        return y
 
 class CrossAttention(nn.Module):
+    """Cross-attention from the stroke stream (n_embd) onto the encoded ASCII context
+    (n_embd_context), with a key-padding mask so the model never attends to PAD chars.
+    Dimensions are decoupled: queries live in n_embd, keys/values are projected up from
+    n_embd_context to n_embd."""
+
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd_context % config.n_ctx_head == 0
-        # query projections for all heads
-        self.c_attn_q = nn.Linear(config.n_embd_context, config.n_embd_context)
-        # key, value projections for all heads
-        self.c_attn_kv = nn.Linear(config.n_embd_context, 2 * config.n_embd_context)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd_context, config.n_embd_context)
-        self.n_ctx_head = config.n_ctx_head
-        self.n_embd_context = config.n_embd_context
+        assert config.n_embd % config.n_ctx_head == 0
+        self.c_attn_q = nn.Linear(config.n_embd, config.n_embd)
+        self.c_attn_kv = nn.Linear(config.n_embd_context, 2 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.n_head = config.n_ctx_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_ctx_head
+        self.dropout = getattr(config, 'dropout', 0.0)
 
-    def forward(self, x, context):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd_context)
+    def forward(self, x, context, context_mask=None):
+        B, T, C = x.size()
         _, T_ctx, _ = context.size()
 
-        # calculate query for all heads in batch and move head forward to be the batch dim
-        q = self.c_attn_q(x).view(B, T, self.n_ctx_head, C // self.n_ctx_head).transpose(1, 2) # (B, nh, T, hs)
+        q = self.c_attn_q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k, v = self.c_attn_kv(context).split(self.n_embd, dim=2)
+        k = k.view(B, T_ctx, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T_ctx, self.n_head, self.head_dim).transpose(1, 2)
 
-        # calculate key, values for all heads in batch and move head forward to be the batch dim
-        k, v = self.c_attn_kv(context).split(self.n_embd_context, dim=2)
-        k = k.view(B, T_ctx, self.n_ctx_head, C // self.n_ctx_head).transpose(1, 2) # (B, nh, T_ctx, hs)
-        v = v.view(B, T_ctx, self.n_ctx_head, C // self.n_ctx_head).transpose(1, 2) # (B, nh, T_ctx, hs)
+        attn_mask = None
+        if context_mask is not None:
+            # context_mask: (B, T_ctx) bool, True = real char (attend), False = PAD.
+            # Rows that are entirely PAD (the CFG "null" condition) are unmasked so
+            # softmax stays well-defined and gives a consistent unconditional signal.
+            keep = context_mask.clone()
+            keep[~keep.any(dim=1)] = True
+            attn_mask = keep.view(B, 1, 1, T_ctx)
 
-        # cross-attention; (B, nh, T, hs) x (B, nh, hs, T_ctx) -> (B, nh, T, T_ctx)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T_ctx) x (B, nh, T_ctx, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
 
-        # output projection
-        y = self.c_proj(y)
-        return y
 
 class MLP(nn.Module):
+    """SwiGLU feed-forward (Shazeer 2020). Gated GLU variant; better quality per FLOP
+    than a plain GELU MLP."""
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.act = NewGELU()
+        hidden = 4 * config.n_embd
+        self.intermediate_size = hidden
+        self.w_gate = nn.Linear(config.n_embd, hidden, bias=False)
+        self.w_up = nn.Linear(config.n_embd, hidden, bias=False)
+        self.w_down = nn.Linear(hidden, config.n_embd, bias=False)
 
     def forward(self, x):
-        return self.c_proj(self.act(self.c_fc(x)))
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+
 
 class Block(nn.Module):
-    """ an unassuming Transformer block """
+    """A pre-norm Transformer block: self-attn -> cross-attn -> SwiGLU MLP."""
 
     def __init__(self, config, has_cross_attn=True):
         super().__init__()
         self.has_cross_attn = has_cross_attn
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
 
         if has_cross_attn:
-            self.ln_2 = nn.LayerNorm(config.n_embd_context)
+            self.ln_2 = RMSNorm(config.n_embd)
             self.cross_attn = CrossAttention(config)
 
-        self.ln_3 = nn.LayerNorm(config.n_embd)
-
+        self.ln_3 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x, context=None):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, rope, context=None, context_mask=None):
+        x = x + self.attn(self.ln_1(x), rope)
 
         if self.has_cross_attn:
             assert context is not None, 'Expected context'
-            x = x + self.cross_attn(self.ln_2(x), context)
+            x = x + self.cross_attn(self.ln_2(x), context, context_mask)
 
         x = x + self.mlp(self.ln_3(x))
         return x
 
+
 class Transformer(nn.Module):
-    """ Transformer Language Model, exactly as seen in GPT-2 """
+    """Decoder-only Transformer LM with cross-attention text conditioning.
+    Modernized: RoPE (no learned positional embedding on the stroke stream),
+    RMSNorm, SwiGLU, fused attention, tied input/output embeddings, and optional
+    classifier-free-guidance dropout of the condition."""
 
     def __init__(self, config):
         super().__init__()
         self.block_size = config.block_size
         self.config = config
+        self.context_pad_token = getattr(config, 'context_pad_token', 0)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             wce = nn.Embedding(config.context_vocab_size, config.n_embd_context),
-            wcpe = nn.Embedding(config.context_block_size, config.n_embd),
+            wcpe = nn.Embedding(config.context_block_size, config.n_embd_context),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight = self.transformer.wte.weight  # weight tying
 
-        # report number of parameters (note we don't count the decoder parameters in lm_head)
+        head_dim = config.n_embd // config.n_ctx_head
+        self._rope_cache = None
+        self._rope_len = 0
+        self._rope_head_dim = head_dim
+
+        self.apply(self._init_weights)
+        # GPT-2 style scaled init for residual projections.
+        for name, p in self.named_parameters():
+            if name.endswith('c_proj.weight') or name.endswith('w_down.weight'):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+
         n_params = sum(p.numel() for p in self.transformer.parameters())
         print("Number of Transformer parameters: {:.0f}".format(n_params,))
 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def get_block_size(self):
         return self.block_size
+
+    def _get_rope(self, T, device, dtype):
+        if self._rope_cache is None or self._rope_len < T or self._rope_cache[0].device != device:
+            length = max(T, self.block_size)
+            self._rope_cache = build_rope_cache(length, self._rope_head_dim, device, dtype)
+            self._rope_len = length
+        return self._rope_cache
 
     def forward(self, idx, context, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
 
-        # forward the GPT model itself
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = tok_emb + pos_emb
+        x = self.transformer.wte(idx)  # (b, t, n_embd); positions handled by RoPE
 
         context_t = context.size(-1)
-        context_pos = torch.arange(0, context_t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-        context_emb = self.transformer.wce(context) # context embeddings of shape (b, t_ctx, n_embd_context)
-        context_pos_emb = self.transformer.wcpe(context_pos)
-        c = context_emb + context_pos_emb
+        context_pos = torch.arange(0, context_t, dtype=torch.long, device=device).unsqueeze(0)
+        c = self.transformer.wce(context) + self.transformer.wcpe(context_pos)
+        context_mask = (context != self.context_pad_token)  # (b, t_ctx) True = real char
 
-        for i, block in enumerate(self.transformer.h):
-            x = block(x, c)
+        rope = self._get_rope(t, device, x.dtype)
+        for block in self.transformer.h:
+            x = block(x, rope, c, context_mask)
 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
-        # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
 
+
 class ModifiedMLP(MLP):
+    """SwiGLU MLP whose hidden width can be elastically sliced for MatFormer."""
     def __init__(self, config, scale_factors):
         super().__init__(config)
-        self.intermediate_size = 4 * config.n_embd
         self.scale_factors = scale_factors
-        self.current_subset_hd = None
+        self.current_subset_hd = self.intermediate_size  # default to full ('xl')
 
     def configure_subnetwork(self, flag):
-        """Configure subnetwork size based on flag."""
         hd = self.intermediate_size
-        if flag == 's':
-            scale = self.scale_factors[0]  # hd/8
-        elif flag == 'm':
-            scale = self.scale_factors[1]  # hd/4
-        elif flag == 'l':
-            scale = self.scale_factors[2]  # hd/2
-        else:
-            scale = self.scale_factors[3]  # hd
-
+        scale = {'s': self.scale_factors[0], 'm': self.scale_factors[1],
+                 'l': self.scale_factors[2], 'xl': self.scale_factors[3]}.get(flag, self.scale_factors[3])
         self.current_subset_hd = int(hd * scale)
 
     def forward(self, x):
-        if self.current_subset_hd is None:
-            raise ValueError("Subnetwork size not configured. Call `configure_subnetwork` first.")
+        h = self.current_subset_hd
+        if h >= self.intermediate_size:
+            return super().forward(x)
+        gate = F.linear(x, self.w_gate.weight[:h])
+        up = F.linear(x, self.w_up.weight[:h])
+        return F.linear(F.silu(gate) * up, self.w_down.weight[:, :h])
 
-        c_fc = self.c_fc.weight[:self.current_subset_hd]
-        c_proj = self.c_proj.weight[:, :self.current_subset_hd]
-        out = F.linear(
-            self.act(F.linear(x, c_fc)),
-            c_proj
-        )
-        return out
 
 class MatFormer(Transformer):
     def __init__(self, config):
         super().__init__(config)
         scale_factors = [1/8, 1/4, 1/2, 1]  # s, m, l, xl
 
-        # Replace FFN in each layer with ModifiedFFN
         for layer_idx in range(config.n_layer):
             self.transformer.h[layer_idx].mlp = ModifiedMLP(config, scale_factors)
+        self.configure_subnetwork('xl')
 
     def configure_subnetwork(self, flag):
         """Configure the subnetwork for all layers based on the flag."""
@@ -372,12 +429,8 @@ class MatFormer(Transformer):
             self.transformer.h[layer_idx].mlp.configure_subnetwork(flag)
 
     def count_trainable_parameters(self):
-        """
-        Calculates the number of *effective* trainable parameters
-        based on the current subnetwork size.
-        """
+        """Effective trainable params for the currently configured subnetwork."""
         total_params = 0
-
         for name, param in self.named_parameters():
             if 'mlp' not in name and param.requires_grad:
                 total_params += param.numel()
@@ -386,11 +439,7 @@ class MatFormer(Transformer):
             mlp = self.transformer.h[i].mlp
             if mlp.current_subset_hd is None:
                 raise ValueError("Subnetwork size not configured.")
-
-            total_params += mlp.current_subset_hd * self.config.n_embd
-            total_params += mlp.c_fc.bias.numel()
-
+            # SwiGLU: gate + up (in->hd) and down (hd->in), all bias-free.
+            total_params += 2 * (mlp.current_subset_hd * self.config.n_embd)
             total_params += self.config.n_embd * mlp.current_subset_hd
-            total_params += mlp.c_proj.bias.numel()
-
         return total_params

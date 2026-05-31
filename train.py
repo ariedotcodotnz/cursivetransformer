@@ -23,6 +23,8 @@ from data import InfiniteDataLoader, create_datasets
 @torch.inference_mode()
 def evaluate(model, dataset, batch_size=15, max_batches=None):
     model.eval()
+    if hasattr(model, 'configure_subnetwork'):
+        model.configure_subnetwork('xl')  # always evaluate the full model
     loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=0)
     losses = []
     for i, batch in enumerate(loader):
@@ -78,7 +80,22 @@ if __name__ == '__main__':
         batch = batch_loader.next()
         X, C, Y = [t.to(args.device) for t in batch]
 
-        flag = random.choice(['s', 'm', 'l', 'xl'])
+        # Classifier-free guidance: randomly drop the ASCII condition (replace with the
+        # null/all-PAD context) so the model also learns the unconditional distribution.
+        # At sample time we extrapolate away from it to sharpen text adherence.
+        if args.cond_drop_prob > 0:
+            drop = torch.rand(C.size(0), device=C.device) < args.cond_drop_prob
+            if drop.any():
+                C = C.clone()
+                C[drop] = 0  # char_PAD_TOKEN -> the null condition
+
+        # MatFormer granularity for this step (see --subnetwork_mode)
+        if args.subnetwork_mode == 'random':
+            flag = random.choice(['s', 'm', 'l', 'xl'])
+        elif args.subnetwork_mode in ('s', 'm', 'l', 'xl'):
+            flag = args.subnetwork_mode
+        else:  # 'full' and anything else -> train the full model every step
+            flag = 'xl'
         model.configure_subnetwork(flag)
 
         # feed into the model
