@@ -58,6 +58,21 @@ def generate_word_combos(raw_json, desired_num_combos=10000, num_words=3):
     return combo_json
 
 
+def sample_combo_indices(num_items, desired_num_combos, num_words):
+    """Vectorized sampling of (desired_num_combos, num_words) index rows with no
+    repeated item within a row. Replaces 497k serial np.random.choice(replace=False)
+    calls (each one permutes all num_items entries) with one vectorized draw plus
+    rejection-resampling of the rare rows that contain a duplicate."""
+    assert num_items > num_words, 'need more base words than words per example'
+    ixs = np.random.randint(0, num_items, size=(desired_num_combos, num_words))
+    while True:
+        srt = np.sort(ixs, axis=1)
+        bad = (np.diff(srt, axis=1) == 0).any(axis=1)
+        if not bad.any():
+            return ixs
+        ixs[bad] = np.random.randint(0, num_items, size=(int(bad.sum()), num_words))
+
+
 ########## TOKENIZATION, AUGMENTATION, AND DATA IO ##########
 
 
@@ -314,27 +329,31 @@ def create_datasets(args):
   # partition the input data into a training and the test set
   test_set_size = min(1000, max(10, int(len(data) * 0.05))) # between 10 and 1000 examples: ideally 5% of dataset
   rp = torch.randperm(len(data)).tolist()
+  train_words = [data[i] for i in rp[:-test_set_size]]
+  test_words = [data[i] for i in rp[-test_set_size:]]
 
-  train_examples = generate_word_combos([data[i] for i in rp[:-test_set_size]], desired_num_combos=args.train_size, num_words=args.num_words)
-  train_examples = [train_examples[i] for i in torch.randperm(len(train_examples)).tolist()]
+  def build_split(words, num_combos):
+      # Combos hold REFERENCES to the base word arrays rather than copies; __getitem__
+      # copies a word only when augmenting it. This turns dataset construction from
+      # minutes + tens of GB (497k examples x num_words deep copies) into seconds.
+      print(f'For a dataset of {len(words)} examples we can generate {comb(len(words), args.num_words)} combinations of {args.num_words} examples.')
+      print(f'Generating {num_combos} random combinations.')
+      ixs = sample_combo_indices(len(words), num_combos, args.num_words)
+      word_strokes = [[words[j]['points'] for j in row] for row in ixs]
+      texts = [' '.join(words[j]['metadata']['asciiSequence'] for j in row) for row in ixs]
+      return word_strokes, texts
 
-  test_examples = generate_word_combos([data[i] for i in rp[-test_set_size:]], desired_num_combos=args.test_size, num_words=args.num_words)
-  test_examples = [test_examples[i] for i in torch.randperm(len(test_examples)).tolist()]
+  train_word_strokes, train_texts = build_split(train_words, args.train_size)
+  test_word_strokes, test_texts = build_split(test_words, args.test_size)
 
-  train_word_strokes = [[copy.deepcopy(stroke) for stroke in v['points']] for v in train_examples]
-  train_texts = [copy.deepcopy(v['metadata']['asciiSequence']) for v in train_examples]
-
-  test_word_strokes = [[copy.deepcopy(stroke) for stroke in v['points']] for v in test_examples]
-  test_texts = [copy.deepcopy(v['metadata']['asciiSequence']) for v in test_examples]
-
-  print(f"Number of examples in the train dataset: {len(train_examples)}")
-  print(f"Number of examples in the test dataset: {len(test_examples)}")
+  print(f"Number of examples in the train dataset: {len(train_word_strokes)}")
+  print(f"Number of examples in the test dataset: {len(test_word_strokes)}")
   print(f"Average number of words per example: {np.mean([len(strokes) for strokes in train_word_strokes]):.1f}")
   print(f"Max token sequence length: {args.max_seq_length}")
   print(f"Number of unique characters in the ascii vocabulary: {len(args.alphabet)}")
   print("Ascii vocabulary:")
   print(f'\t"{args.alphabet}"')
-  print(f"Split up the dataset into {len(train_examples)} training examples and {len(test_examples)} test examples")
+  print(f"Split up the dataset into {len(train_word_strokes)} training examples and {len(test_word_strokes)} test examples")
 
   # wrap in dataset objects
   train_dataset = StrokeDataset(train_word_strokes, train_texts, args, name='train')

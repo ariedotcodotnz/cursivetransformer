@@ -174,3 +174,12 @@ Replace dated `makemore`/GPT-2-isms with current standard transformer components
   encoder on/off). NOTE: run-1 checkpoint predates the arch stamp; to sample it with
   this code set n_context_layer=0 explicitly.
   Notebook v2 defaults: batch 64 (repo's own A/B favored it), max_steps 75k (~1h).
+- 2026-06-10: User's v2 Colab launch interrupted (^C) during dataset construction —
+  the ORIGINAL repo's generate_word_combos does 497k serial np.random.choice
+  (replace=False) calls (~full permutation each) + 497k dict builds + ~2M array
+  copies + ~2M deepcopies: minutes of wall time and ~28 GB RAM. Fix: vectorized
+  rejection sampling of combo index rows (sample_combo_indices) + lazy per-example
+  stroke lists that hold REFERENCES to the base word arrays (copied only inside
+  augmentation, which already does word.copy()). Full-size build (bigbank_3500,
+  497k x 4 words) measured locally at 3.0 s, ~100 MB. New smoke test asserts the
+  shared base arrays are never mutated by augmented __getitem__. Only data.py changed.

@@ -126,6 +126,15 @@ assert row0_tail[0] == train_ds.END_TOKEN
 assert (row0_tail[1:] == train_ds.PAD_TOKEN).all(), "row finished by END must be PAD-filled"
 print("[ok] generate() stops at END and PAD-fills finished rows")
 
+# ---- lazy combos: base word arrays must never be mutated by __getitem__ ----
+base_arrays = [w for ws in train_ds.raw_word_strokes[:4] for w in ws]
+snapshots = [a.copy() for a in base_arrays]
+for i in range(4):
+    _ = train_ds[i]  # augment path must copy, not mutate, the shared base arrays
+for a, snap in zip(base_arrays, snapshots):
+    assert np.array_equal(a, snap), "augmentation mutated a shared base word array!"
+print("[ok] lazy combo references: base arrays unmutated after augmented __getitem__")
+
 # ---- optimizer param groups + cosine warmup scheduler via get_checkpoint ----
 from model import get_checkpoint, save_checkpoint
 args.load_from_run_id = None
