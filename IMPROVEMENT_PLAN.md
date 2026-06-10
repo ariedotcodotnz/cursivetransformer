@@ -153,3 +153,24 @@ Replace dated `makemore`/GPT-2-isms with current standard transformer components
      loss dilution) so the model self-terminates even without explicit stopping.
   The trained checkpoint is unaffected by these fixes (model code unchanged) — fixes
   1-2 repair inference for the EXISTING checkpoint; fix 3 benefits the next training run.
+- 2026-05-31 (pre-retrain, "v2" recipe). Changes informed by run 1 (plateau ~52k,
+  train/test gap ~0.11, n_layer mismatch incident at inference):
+  1. Cosine LR schedule with 1k-step linear warmup, decaying to 10% of peak
+     (--lr_schedule cosine, default; legacy StepLR kept via 'step').
+  2. Gradient clipping (--grad_clip 1.0) — insurance at LR 1e-2.
+  3. AdamW weight-decay exclusions: no decay on biases, norms, embeddings.
+  4. Real residual dropout (attn out, cross-attn out, MLP out) wired to --dropout;
+     recommended 0.05 for the retrain to address the observed mild overfit.
+  5. NEW: small bidirectional text encoder over the ASCII context
+     (--n_context_layer 2, PAD-masked, SwiGLU/RMSNorm blocks). Cross-attention now
+     reads contextualized characters instead of raw char+pos embeddings — targets
+     the spelling plateau. 0 disables it (exact old behavior). Adds ~130k params.
+  6. Checkpoints stamp their architecture (model_args) and get_checkpoint overrides
+     mismatched args at load — the n_layer-mismatch failure class is gone. Loading
+     order restructured (read ckpt -> build model -> load weights).
+  7. GenerationParams.guidance_scale default 1.5 so W&B training previews show
+     CFG-quality samples. num_workers now an arg (notebook uses 8 for batch 64).
+  All covered by smoke_test.py (param groups, warmup ramp, arch-override round trip,
+  encoder on/off). NOTE: run-1 checkpoint predates the arch stamp; to sample it with
+  this code set n_context_layer=0 explicitly.
+  Notebook v2 defaults: batch 64 (repo's own A/B favored it), max_steps 75k (~1h).

@@ -25,7 +25,8 @@ class GenerationParams:
     temperature: float = 1.0
     top_k: bool = None
     top_p: float = 0.95            # nucleus sampling; set to None/1.0 to disable
-    guidance_scale: float = 1.0    # classifier-free guidance; >1 sharpens text adherence
+    guidance_scale: float = 1.5    # classifier-free guidance; >1 sharpens text adherence
+                                   # (also used for the W&B training previews)
     structured: bool = True        # mask out tokens that violate the (theta, r) pair structure
     do_sample: bool = False
     num_steps: int = 1050

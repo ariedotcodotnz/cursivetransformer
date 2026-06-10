@@ -45,6 +45,11 @@ def get_all_args(use_argparse=True):
         'subnetwork_mode': ('full', str, "MatFormer training granularity: 'full' (always xl, best single-model quality), "
                                           "'random' (stochastic MatFormer for elastic inference), or a fixed flag s/m/l/xl"),
         'dropout': (0.0, float, 'Dropout probability inside the Transformer blocks'),
+        'lr_schedule': ('cosine', str, "LR schedule: 'cosine' (linear warmup + cosine decay, recommended) or 'step' (legacy StepLR)"),
+        'warmup_steps': (1000, int, 'Linear LR warmup steps (cosine schedule only)'),
+        'grad_clip': (1.0, float, 'Clip the gradient norm to this value (0 = no clipping)'),
+        'n_context_layer': (2, int, 'Bidirectional encoder layers over the ASCII context (0 = raw char embeddings, as before)'),
+        'num_workers': (4, int, 'DataLoader worker processes for the training loader'),
         'alphabet': (" enaitoshrdx.vpukbgfcymzw1lqj804I92637OTAS5N)EHR\"\'(BCQLMWYU,ZF!DXV?KPGJ", str,
                         'All the characters that this model will be able to draw'),
         'dataset_name': ('bigeasybank', str, 'The name of the .zip file containing your dataset'),
@@ -77,15 +82,70 @@ def get_all_args(use_argparse=True):
 
 ########## MODEL I/O ##########
 
-def get_checkpoint(args, sample_only):
-    model = MatFormer(args)
+# Architecture-defining args. Stamped into every checkpoint so that loading can
+# rebuild the exact trained model even if the caller's args disagree.
+ARCH_KEYS = ('n_layer', 'n_embd', 'n_embd_context', 'n_ctx_head', 'n_context_layer',
+             'vocab_size', 'block_size', 'context_block_size', 'context_vocab_size')
 
+
+def configure_optimizer(model, args):
+    """AdamW with standard weight-decay exclusions: no decay on biases, norm weights
+    (dim < 2), or embeddings (incl. the tied wte/lm_head weight)."""
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_embedding = 'wte' in name or 'wce' in name or 'wcpe' in name
+        (no_decay if (p.dim() < 2 or is_embedding) else decay).append(p)
+    groups = [{'params': decay, 'weight_decay': args.weight_decay},
+              {'params': no_decay, 'weight_decay': 0.0}]
+    return torch.optim.AdamW(groups, lr=args.learning_rate, betas=(0.9, 0.99), eps=1e-8)
+
+
+def configure_scheduler(optimizer, args):
+    if getattr(args, 'lr_schedule', 'step') == 'cosine':
+        warmup = max(1, getattr(args, 'warmup_steps', 1000))
+        total = max(args.max_steps, warmup + 1)
+        min_ratio = 0.1  # decay to 10% of peak LR by max_steps
+        def lr_lambda(step):
+            if step < warmup:
+                return (step + 1) / warmup
+            t = min(1.0, (step - warmup) / max(1, total - warmup))
+            return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * t))
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    return torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_lr_every, gamma=args.lr_decay)
+
+
+def get_checkpoint(args, sample_only):
+    # Locate and read the checkpoint FIRST, so the model is built with the exact
+    # architecture it was trained with (prevents train/inference arch mismatches).
+    checkpoint, from_wandb = None, False
+    if args.load_from_run_id or sample_only:
+        if os.path.exists(args.local_checkpoint_path):
+            checkpoint = torch.load(args.local_checkpoint_path, weights_only=True)
+            print(f"Loaded checkpoint from local path: {args.local_checkpoint_path}")
+        elif args.load_from_run_id:
+            artifact = get_latest_checkpoint_artifact(args)
+            artifact_dir = artifact.download()
+            checkpoint = torch.load(os.path.join(artifact_dir, "best_checkpoint.pt"), weights_only=True)
+            from_wandb = True
+        else:
+            print("No local model or W&B run ID provided. Exiting.")
+            sys.exit()
+
+    if checkpoint is not None:
+        for k, v in checkpoint.get('model_args', {}).items():
+            if getattr(args, k, None) != v:
+                print(f"Checkpoint architecture override: args.{k} = {v} (was {getattr(args, k, None)})")
+                setattr(args, k, v)
+
+    model = MatFormer(args)
     model.to(args.device)
     print(f"Model #params: {sum(p.numel() for p in model.parameters())}")
 
     if not sample_only:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.99), eps=1e-8)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_lr_every, gamma=args.lr_decay)
+        optimizer = configure_optimizer(model, args)
+        scheduler = configure_scheduler(optimizer, args)
     else:
         optimizer = None
         scheduler = None
@@ -93,32 +153,15 @@ def get_checkpoint(args, sample_only):
     step = 0
     best_loss = None
 
-    if args.load_from_run_id or sample_only:
-        if os.path.exists(args.local_checkpoint_path):
-            checkpoint = torch.load(args.local_checkpoint_path, weights_only=True)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"Loaded model from local path: {args.local_checkpoint_path}")
-            if not sample_only:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                step = checkpoint['step']
-                best_loss = checkpoint['best_loss']
-        elif args.load_from_run_id:
-            artifact = get_latest_checkpoint_artifact(args)
-            artifact_dir = artifact.download()
-            checkpoint = torch.load(os.path.join(artifact_dir, "best_checkpoint.pt"), weights_only=True)
-            model.load_state_dict(checkpoint['model_state_dict'])
-
-            if not sample_only:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                step = checkpoint['step'] + 1
-                best_loss = checkpoint['best_loss']
-
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if not sample_only:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            step = checkpoint['step'] + (1 if from_wandb else 0)
+            best_loss = checkpoint['best_loss']
+        if from_wandb:
             save_checkpoint(model, args.local_checkpoint_path, optimizer, scheduler, step, best_loss)
-        else:
-            print("No local model or W&B run ID provided. Exiting.")
-            sys.exit()
 
     return model, optimizer, scheduler, step, best_loss
 
@@ -143,6 +186,9 @@ def get_latest_checkpoint_artifact(args, verbose=True):
 
 def save_checkpoint(model, path, optimizer=None, scheduler=None, step=None, best_loss=None):
     checkpoint = {'model_state_dict': model.state_dict()}
+    cfg = getattr(model, 'config', None)
+    if cfg is not None:  # stamp the architecture so loading can never mismatch it
+        checkpoint['model_args'] = {k: getattr(cfg, k) for k in ARCH_KEYS if hasattr(cfg, k)}
     if optimizer is not None:
         checkpoint['optimizer_state_dict'] = optimizer.state_dict()
     if scheduler is not None:
@@ -205,6 +251,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_ctx_head
         self.dropout = getattr(config, 'dropout', 0.0)
+        self.resid_drop = nn.Dropout(self.dropout)
         # QK-norm stabilizes training at the high LR (1e-2) this model uses.
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
@@ -226,7 +273,7 @@ class CausalSelfAttention(nn.Module):
             q, k, v, is_causal=True,
             dropout_p=self.dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(y)
+        return self.resid_drop(self.c_proj(y))
 
 
 class CrossAttention(nn.Module):
@@ -245,6 +292,7 @@ class CrossAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_ctx_head
         self.dropout = getattr(config, 'dropout', 0.0)
+        self.resid_drop = nn.Dropout(self.dropout)
 
     def forward(self, x, context, context_mask=None):
         B, T, C = x.size()
@@ -268,22 +316,75 @@ class CrossAttention(nn.Module):
             q, k, v, attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(y)
+        return self.resid_drop(self.c_proj(y))
 
 
 class MLP(nn.Module):
     """SwiGLU feed-forward (Shazeer 2020). Gated GLU variant; better quality per FLOP
-    than a plain GELU MLP."""
-    def __init__(self, config):
+    than a plain GELU MLP. `dim` lets the text encoder reuse it at n_embd_context."""
+    def __init__(self, config, dim=None):
         super().__init__()
-        hidden = 4 * config.n_embd
+        d = dim if dim is not None else config.n_embd
+        hidden = 4 * d
         self.intermediate_size = hidden
-        self.w_gate = nn.Linear(config.n_embd, hidden, bias=False)
-        self.w_up = nn.Linear(config.n_embd, hidden, bias=False)
-        self.w_down = nn.Linear(hidden, config.n_embd, bias=False)
+        self.w_gate = nn.Linear(d, hidden, bias=False)
+        self.w_up = nn.Linear(d, hidden, bias=False)
+        self.w_down = nn.Linear(hidden, d, bias=False)
+        self.drop = nn.Dropout(getattr(config, 'dropout', 0.0))
 
     def forward(self, x):
-        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+        return self.drop(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+
+
+class EncoderSelfAttention(nn.Module):
+    """Bidirectional self-attention over the ASCII context (PAD keys masked), so each
+    character embedding can see its neighbors before cross-attention reads it."""
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd_context % config.n_ctx_head == 0
+        self.c_attn = nn.Linear(config.n_embd_context, 3 * config.n_embd_context)
+        self.c_proj = nn.Linear(config.n_embd_context, config.n_embd_context)
+        self.n_head = config.n_ctx_head
+        self.n_embd_context = config.n_embd_context
+        self.head_dim = config.n_embd_context // config.n_ctx_head
+        self.dropout = getattr(config, 'dropout', 0.0)
+        self.resid_drop = nn.Dropout(self.dropout)
+
+    def forward(self, x, key_mask=None):
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd_context, dim=2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        attn_mask = None
+        if key_mask is not None:
+            keep = key_mask.clone()
+            keep[~keep.any(dim=1)] = True  # all-PAD (CFG null) rows attend everywhere
+            attn_mask = keep.view(B, 1, 1, T)
+
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_drop(self.c_proj(y))
+
+
+class EncoderBlock(nn.Module):
+    """Pre-norm bidirectional block for the small text encoder."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = RMSNorm(config.n_embd_context)
+        self.attn = EncoderSelfAttention(config)
+        self.ln_2 = RMSNorm(config.n_embd_context)
+        self.mlp = MLP(config, dim=config.n_embd_context)
+
+    def forward(self, x, key_mask=None):
+        x = x + self.attn(self.ln_1(x), key_mask)
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
 
 class Block(nn.Module):
@@ -332,6 +433,10 @@ class Transformer(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
+        n_enc = getattr(config, 'n_context_layer', 0)
+        if n_enc > 0:  # small bidirectional encoder contextualizes the ASCII chars
+            self.transformer['henc'] = nn.ModuleList([EncoderBlock(config) for _ in range(n_enc)])
+            self.transformer['ln_enc'] = RMSNorm(config.n_embd_context)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight  # weight tying
 
@@ -378,6 +483,10 @@ class Transformer(nn.Module):
         context_pos = torch.arange(0, context_t, dtype=torch.long, device=device).unsqueeze(0)
         c = self.transformer.wce(context) + self.transformer.wcpe(context_pos)
         context_mask = (context != self.context_pad_token)  # (b, t_ctx) True = real char
+        if 'henc' in self.transformer:
+            for eblock in self.transformer.henc:
+                c = eblock(c, context_mask)
+            c = self.transformer.ln_enc(c)
 
         rope = self._get_rope(t, device, x.dtype)
         for block in self.transformer.h:
@@ -411,7 +520,7 @@ class ModifiedMLP(MLP):
             return super().forward(x)
         gate = F.linear(x, self.w_gate.weight[:h])
         up = F.linear(x, self.w_up.weight[:h])
-        return F.linear(F.silu(gate) * up, self.w_down.weight[:, :h])
+        return self.drop(F.linear(F.silu(gate) * up, self.w_down.weight[:, :h]))
 
 
 class MatFormer(Transformer):
@@ -432,7 +541,10 @@ class MatFormer(Transformer):
         """Effective trainable params for the currently configured subnetwork."""
         total_params = 0
         for name, param in self.named_parameters():
-            if 'mlp' not in name and param.requires_grad:
+            # exclude only the elastic decoder MLPs ('transformer.h.*'); the text
+            # encoder ('transformer.henc.*') MLPs are always full-width
+            is_elastic_mlp = name.startswith('transformer.h.') and '.mlp.' in name
+            if not is_elastic_mlp and param.requires_grad:
                 total_params += param.numel()
 
         for i in range(self.config.n_layer):

@@ -126,4 +126,41 @@ assert row0_tail[0] == train_ds.END_TOKEN
 assert (row0_tail[1:] == train_ds.PAD_TOKEN).all(), "row finished by END must be PAD-filled"
 print("[ok] generate() stops at END and PAD-fills finished rows")
 
+# ---- optimizer param groups + cosine warmup scheduler via get_checkpoint ----
+from model import get_checkpoint, save_checkpoint
+args.load_from_run_id = None
+m2, opt2, sched2, step2, bl2 = get_checkpoint(args, sample_only=False)
+assert len(opt2.param_groups) == 2 and opt2.param_groups[1]['weight_decay'] == 0.0
+lrs = []
+for _ in range(3):
+    logits2, loss2 = m2(X, C, Y)
+    opt2.zero_grad(); loss2.backward(); opt2.step(); sched2.step()
+    lrs.append(sched2.get_last_lr()[0])
+assert lrs[0] < lrs[1] < lrs[2] <= args.learning_rate, "cosine warmup should ramp the LR up"
+print(f"[ok] AdamW param groups (decay/no-decay) + cosine warmup (lr ramp {lrs[0]:.2e} -> {lrs[2]:.2e})")
+
+# ---- checkpoint stamps the architecture; mismatched args are overridden on load ----
+import os, tempfile, copy as _copy
+ckpt_path = os.path.join(tempfile.gettempdir(), 'ct_smoke_ckpt.pt')
+save_checkpoint(m2, ckpt_path, opt2, sched2, step=3, best_loss=1.0)
+args_bad = _copy.deepcopy(args)
+args_bad.n_layer = args.n_layer + 1          # wrong on purpose (the Colab failure mode)
+args_bad.n_context_layer = 0                 # also wrong on purpose
+args_bad.local_checkpoint_path = ckpt_path
+m3, *_ = get_checkpoint(args_bad, sample_only=True)
+assert args_bad.n_layer == args.n_layer and args_bad.n_context_layer == args.n_context_layer
+with torch.no_grad():
+    _ = m3(X, C)
+os.remove(ckpt_path)
+print("[ok] checkpoint arch-stamp overrides mismatched args and loads cleanly")
+
+# ---- text encoder can be disabled (n_context_layer=0) ----
+args_noenc = _copy.deepcopy(args)
+args_noenc.n_context_layer = 0
+m0 = MatFormer(args_noenc)
+logits0, loss0 = m0(X, C, Y)
+assert torch.isfinite(loss0)
+assert not any('henc' in n for n, _ in m0.named_parameters())
+print("[ok] n_context_layer=0 (no text encoder) still works")
+
 print("\nALL SMOKE TESTS PASSED")

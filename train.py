@@ -65,7 +65,7 @@ if __name__ == '__main__':
     print(f"Dataset determined that: {args.vocab_size=}, {args.block_size=}")
 
     model, optimizer, scheduler, step, best_loss = get_checkpoint(args, sample_only=False)
-    batch_loader = InfiniteDataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=4)
+    batch_loader = InfiniteDataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=args.num_workers)
 
     wandb.watch(model, log="all", log_freq=args.log_every, log_graph=False)  # model saving stuff
 
@@ -101,8 +101,10 @@ if __name__ == '__main__':
         # feed into the model
         logits, loss = model(X, C, Y)
 
-        # calculate the gradient, update the weights
+        # calculate the gradient, clip it, update the weights
         model.zero_grad(set_to_none=True) ; loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step() ; scheduler.step()
         wandb.log({"train_loss_step": loss.item(), "step": step})
         t1 = time.time()
