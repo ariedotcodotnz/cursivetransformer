@@ -90,6 +90,21 @@ assert len(d_poll) == len(d_clean), "decode kept word groups from after END"
 assert all(np.allclose(a, b) for a, b in zip(d_clean, d_poll)), "post-END tokens leaked into decode"
 print("[ok] decode truncates at END (post-END tokens ignored)")
 
+# ---- stray WORD tokens must not create empty groups that shift later words ----
+W = train_ds.WORD_TOKEN
+shifted = np.array([W, W, th0, r0, th0, r0])  # leading stray pair -> would shift words
+groups = train_ds.decode_stroke(shifted)
+assert len(groups) == 1 and len(groups[0]) == 2, "empty word group leaked through decode"
+print("[ok] empty word groups from stray WORD tokens are dropped")
+
+# ---- structured mask: WORD tokens are forced to come in pairs, never triples ----
+from sample import _structured_mask
+v = _structured_mask(torch.tensor([[th0, r0, W]]), train_ds)
+assert v[0, W] and v[0].sum() == 1, "after a lone WORD token only its partner is legal"
+v = _structured_mask(torch.tensor([[th0, r0, W, W]]), train_ds)
+assert not v[0, W] and not v[0, train_ds.END_TOKEN] and v[0, th0], "after a WORD pair a stroke must start"
+print("[ok] structured mask enforces WORD-token pairing")
+
 # ---- targets: END predicted after last real token, then a short supervised PAD tail ----
 x0, c0, y0 = train_ds[0]
 seq_len = int((x0 == train_ds.END_TOKEN).nonzero()[0])

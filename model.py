@@ -269,9 +269,9 @@ class CausalSelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True,
-            dropout_p=self.dropout if self.training else 0.0)
+        # No dropout inside SDPA: dropout_p > 0 can force a fallback off the fused
+        # FlashAttention kernel on some builds. Regularization comes from resid_drop.
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.c_proj(y))
 
@@ -312,9 +312,7 @@ class CrossAttention(nn.Module):
             keep[~keep.any(dim=1)] = True
             attn_mask = keep.view(B, 1, 1, T_ctx)
 
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.c_proj(y))
 
@@ -364,9 +362,7 @@ class EncoderSelfAttention(nn.Module):
             keep[~keep.any(dim=1)] = True  # all-PAD (CFG null) rows attend everywhere
             attn_mask = keep.view(B, 1, 1, T)
 
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.c_proj(y))
 

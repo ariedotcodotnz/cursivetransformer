@@ -245,7 +245,10 @@ class StrokeDataset(Dataset):
       if len(end_pos) > 0:
           ix = ix[:end_pos[0]]
       ix_list = self.split_by_word_tokens(ix)
-      return [self.decode_word_strokes(ix) for ix in ix_list]
+      words = [self.decode_word_strokes(w) for w in ix_list]
+      # A stray WORD token can create an empty group that would shift every later word
+      # by one position; an empty "word" is never legitimate, so drop them.
+      return [w for w in words if len(w) > 0]
 
     def decode_word_strokes(self, ix):
         if isinstance(ix, torch.Tensor):

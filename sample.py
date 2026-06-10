@@ -94,7 +94,19 @@ def _structured_mask(idx, dataset):
 
     expect_theta = (theta_tok | specials).unsqueeze(0)  # (1, vocab)
     expect_r = r_tok.unsqueeze(0)
-    return torch.where((parity == 0).unsqueeze(1), expect_theta, expect_r)
+    valid = torch.where((parity == 0).unsqueeze(1), expect_theta, expect_r).clone()
+
+    # WORD tokens only ever appear in pairs between words. After a lone WORD token the
+    # only legal continuation is its partner; after a completed pair a stroke must start
+    # (a third WORD or an END there would create an empty word group, which shifts all
+    # later words by one slot and makes a word vanish from the output).
+    last_is_w = idx[:, -1] == dataset.WORD_TOKEN
+    prev_is_w = (idx[:, -2] == dataset.WORD_TOKEN) if idx.size(1) >= 2 else torch.zeros_like(last_is_w)
+    only_word = torch.zeros(vocab, dtype=torch.bool, device=device)
+    only_word[dataset.WORD_TOKEN] = True
+    valid[last_is_w & ~prev_is_w] = only_word
+    valid[last_is_w & prev_is_w] = theta_tok
+    return valid
 
 
 def _filter_logits(logits, temperature, top_k, top_p):
@@ -268,8 +280,11 @@ def generate_helper_fn(model, dataset, word_list, params):
 
 
 def generate_paragraph(model, dataset, text, params, word_list_offsets=None, regenerate_ixs=None):
-    torch.manual_seed(params.seed)  # system inits
-    torch.cuda.manual_seed_all(params.seed)
+    if word_list_offsets is None:  # fresh generation: reproducible from params.seed
+        torch.manual_seed(params.seed)
+        torch.cuda.manual_seed_all(params.seed)
+    # Regeneration deliberately does NOT reseed: reseeding made every rerun reproduce
+    # the identical (possibly identically bad) words, so retrying could never help.
 
     word_list = text.strip(' ').split(' ')
     if word_list_offsets is None:

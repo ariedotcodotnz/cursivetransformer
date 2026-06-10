@@ -183,3 +183,22 @@ Replace dated `makemore`/GPT-2-isms with current standard transformer components
   augmentation, which already does word.copy()). Full-size build (bigbank_3500,
   497k x 4 words) measured locally at 3.0 s, ~100 MB. New smoke test asserts the
   shared base arrays are never mutated by augmented __getitem__. Only data.py changed.
+- 2026-06-10 (v2 run results, run yebt649s): first ~6.3k steps on an L4 (~230 ms/step),
+  resumed flawlessly on an A100 at ~88 ms/step (SDPA-dropout patch + A100 as predicted).
+  Best test loss 1.5006 @ 17.5k steps (run 1 best: 1.5672 @ 52.5k; ~0.02 of the gap is
+  PAD-tail comparability) — a real ~0.05-nat gain in 1/3 the steps. Overfit onset after
+  17.5k (train 1.41 vs test 1.51 rising); user stopped at 23.8k. Best ckpt = 17.5k, saved.
+  v3 recipe (notebook updated, run name modern_v3): MAX_STEPS 30000 so the cosine tail
+  lands at convergence (v2's best was trained at LR~0.0089, never saw low LR), and
+  dropout 0.1 to delay the overfit. Everything else unchanged. ~45-50 min on A100.
+  Beyond v3 the binding constraint is the 3,325-word base dataset, not training.
+- 2026-06-10 (regen "word vanishes" bug): regenerating a word could drop it entirely.
+  Cause: a stray WORD token at the start of the regenerated chunk creates an EMPTY
+  word group; truncation to the expected word count then puts the empty group in the
+  target slot and discards the real strokes. Compounded by generate_paragraph
+  reseeding torch with params.seed on every call -> every rerun reproduced the same
+  failure. Fixes (smoke-tested): (1) structured mask now enforces WORD-token pairing
+  (lone W -> partner forced; after W,W -> stroke must start, no 3rd W / END);
+  (2) decode_stroke drops empty word groups; (3) regeneration no longer reseeds, so
+  each rerun is a fresh attempt (fresh generation still seeds from params.seed).
+  Files: sample.py, data.py.
