@@ -223,6 +223,12 @@ class StrokeDataset(Dataset):
         return encoded.flatten()
 
     def decode_stroke(self, ix):
+      if isinstance(ix, torch.Tensor):
+          ix = ix.cpu().numpy()
+      # The model is only trained up to its END token; anything after it is noise.
+      end_pos = np.where(ix == self.END_TOKEN)[0]
+      if len(end_pos) > 0:
+          ix = ix[:end_pos[0]]
       ix_list = self.split_by_word_tokens(ix)
       return [self.decode_word_strokes(ix) for ix in ix_list]
 
@@ -290,8 +296,12 @@ class StrokeDataset(Dataset):
         x[:seq_len] = torch.tensor(encoded_stroke[:seq_len], dtype=torch.long)
         x[seq_len] = self.END_TOKEN
 
-        y[:seq_len] = x[1:seq_len+1]
-        y[seq_len] = self.END_TOKEN  # predict END after the last real token; rest stays -1 (ignored)
+        y[:seq_len] = x[1:seq_len+1]  # the last real position's target is the END token
+        # Teach the model to go quiet after END (END->PAD, then PAD->PAD) but only for a
+        # few positions, so these easy PAD predictions don't flood the loss the way the
+        # old full-PAD targets did. The rest of the tail stays -1 (ignored).
+        tail_end = min(self.max_seq_length, seq_len + 1 + 8)
+        y[seq_len:tail_end] = self.PAD_TOKEN
 
         c = self.encode_text(text)
         return x, c, y

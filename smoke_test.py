@@ -78,4 +78,52 @@ assert pad_frac > 0, "expected at least one example with ignored (-1) padded tar
 xi = train_ds[int(max(range(len(fracs)), key=lambda k: fracs[k]))][0]
 assert (xi == train_ds.PAD_TOKEN).any() and not (xi == -1).any()
 print(f"[ok] padded-target ignore fraction (max over set) = {pad_frac:.2f} (these no longer pollute the loss)")
+
+# ---- decode must ignore anything after END (post-END garbage fix) ----
+import numpy as np
+th0 = int(train_ds.cumulative_sizes[1]) + 10   # a valid theta token
+r0 = 10                                        # a valid pen-down r token
+clean = np.array([th0, r0, th0, r0])
+polluted = np.concatenate([clean, [train_ds.END_TOKEN], [th0, r0, th0, r0, th0, r0]])
+d_clean, d_poll = train_ds.decode_stroke(clean), train_ds.decode_stroke(polluted)
+assert len(d_poll) == len(d_clean), "decode kept word groups from after END"
+assert all(np.allclose(a, b) for a, b in zip(d_clean, d_poll)), "post-END tokens leaked into decode"
+print("[ok] decode truncates at END (post-END tokens ignored)")
+
+# ---- targets: END predicted after last real token, then a short supervised PAD tail ----
+x0, c0, y0 = train_ds[0]
+seq_len = int((x0 == train_ds.END_TOKEN).nonzero()[0])
+assert y0[seq_len-1] == train_ds.END_TOKEN, "last real position should predict END"
+assert y0[seq_len] == train_ds.PAD_TOKEN, "END should be followed by a PAD target"
+tail_end = min(len(y0), seq_len + 9)
+assert (y0[seq_len:tail_end] == train_ds.PAD_TOKEN).all(), "PAD tail should be supervised"
+if tail_end < len(y0):
+    assert y0[tail_end] == -1, "targets beyond the short tail should stay ignored (-1)"
+print("[ok] END->PAD tail supervision in targets")
+
+# ---- generation stops at END: finished rows must emit PAD only ----
+# Untrained models rarely emit END on their own, so seed one row with END in the warmup
+# region via a wrapper that forces END as the first generated token for row 0.
+class ForceEndOnce(torch.nn.Module):
+    def __init__(self, m, end_token):
+        super().__init__()
+        self.m, self.end_token, self.fired = m, end_token, False
+    def get_block_size(self): return self.m.get_block_size()
+    def configure_subnetwork(self, flag): self.m.configure_subnetwork(flag)
+    def forward(self, idx, context, targets=None):
+        logits, loss = self.m(idx, context, targets)
+        if not self.fired:
+            logits = logits.clone()
+            logits[0, -1, :] = -1e9
+            logits[0, -1, self.end_token] = 1e9  # row 0 must emit END right now
+            self.fired = True
+        return logits, loss
+forced = ForceEndOnce(model, train_ds.END_TOKEN)
+out = generate(forced, X_init, C, max_new_tokens=30, do_sample=True, top_p=0.95,
+               structured=True, dataset=train_ds)
+row0_tail = out[0, X_init.size(1):]
+assert row0_tail[0] == train_ds.END_TOKEN
+assert (row0_tail[1:] == train_ds.PAD_TOKEN).all(), "row finished by END must be PAD-filled"
+print("[ok] generate() stops at END and PAD-fills finished rows")
+
 print("\nALL SMOKE TESTS PASSED")

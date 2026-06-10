@@ -127,9 +127,22 @@ def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=Fal
     use_cfg = guidance_scale is not None and guidance_scale != 1.0
     null_context = torch.zeros_like(context) if use_cfg else None  # all-PAD == unconditional
 
+    # Stop each sequence at its END token. The model has no training signal for what
+    # follows END (padded targets are ignored by the loss), so free-running past it
+    # appends garbage strokes to every sample. Once a row emits END we force PAD from
+    # then on, and exit early when the whole batch is finished.
+    end_token = dataset.END_TOKEN if dataset is not None else None
+    pad_token = dataset.PAD_TOKEN if dataset is not None else None
+    finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
+
     block_size = model.get_block_size()
     steps = max(0, max_new_tokens-idx.size(1))
     for i in range(steps):
+        if end_token is not None and bool(finished.all()):
+            pad_fill = torch.full((idx.size(0), steps - i), pad_token,
+                                  dtype=idx.dtype, device=idx.device)
+            idx = torch.cat((idx, pad_fill), dim=1)
+            break
         # if the sequence context is growing too long we must crop it at block_size
         idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
         # forward the model to get the logits for the index in the sequence
@@ -153,6 +166,10 @@ def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=Fal
             idx_next = torch.multinomial(probs, num_samples=1)
         else:
             _, idx_next = torch.topk(probs, k=1, dim=-1)
+        if end_token is not None:  # finished rows keep emitting PAD
+            idx_next = torch.where(finished.unsqueeze(1),
+                                   torch.full_like(idx_next, pad_token), idx_next)
+            finished |= idx_next.squeeze(1) == end_token
         # append sampled index to the running sequence and continue
         idx = torch.cat((idx, idx_next), dim=1)
 

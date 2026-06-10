@@ -138,3 +138,18 @@ Replace dated `makemore`/GPT-2-isms with current standard transformer components
   NOTE: requires training from scratch (architecture changed; old checkpoints incompatible).
   Suggested first A100 run: keep README hyperparams, add `--cond_drop_prob 0.1`
   (default) and sample with `guidance_scale~2.0`, `top_p~0.95`, `structured=True`.
+- 2026-05-31: POST-MORTEM of first user A100 run (125k steps, bigbank_3500). Loss was
+  healthy (test 1.567 best @52.5k) but samples looked terrible. Root cause: the -1
+  target-masking fix removed the implicit "emit PAD after END" training signal the
+  original pipeline relied on. generate() always free-runs to ~1050 tokens and decode
+  never truncated at END, so every sample = real handwriting + hundreds of untrained
+  garbage tokens drawn after END (made worse by structured masking, which forbade PAD
+  in that region, forcing stroke tokens). Fixes, all validated in smoke_test.py:
+  1. sample.py generate(): per-row stop at END, force PAD afterwards, early-exit when
+     the batch is finished (also a big sampling speedup).
+  2. data.py decode_stroke(): truncate at the first END before decoding (defense in
+     depth; also fixes decoding for any caller that bypasses generate()).
+  3. data.py __getitem__(): supervise a short END->PAD + 8-token PAD tail (negligible
+     loss dilution) so the model self-terminates even without explicit stopping.
+  The trained checkpoint is unaffected by these fixes (model code unchanged) — fixes
+  1-2 repair inference for the EXISTING checkpoint; fix 3 benefits the next training run.
