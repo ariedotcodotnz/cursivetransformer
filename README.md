@@ -49,6 +49,36 @@ One might suggest using polar coordinates of the form (`theta`, `magnitude`, and
 Now that we have tokens that look just like those used for language modeling, we can use boilerplate LLM Transformer code from hereon out.
 
 
+## Few-shot style cloning (2026)
+
+The model can be conditioned on **a few words of someone's handwriting** and will write
+new text in that style. A `StyleEncoder` (bidirectional transformer + attention pooling
+into 16 style memory tokens, cf. the writer-style memories of SDT/CASHG) reads a
+reference stroke sequence; its output is cross-attended alongside the ASCII context.
+Training uses *style-consistent augmentation*: each example's style reference and target
+words share one set of style parameters (slant, x/y proportions, stroke density), so the
+encoder learns to extract style rather than content. A separate style dropout
+(`--style_drop_prob 0.1`) enables **style classifier-free guidance** at sample time
+(`style_guidance_scale` > 1 mimics the reference more strongly).
+
+```python
+from data import load_style_reference
+from sample import GenerationParams, generate_paragraph, plot_paragraph
+
+style = load_style_reference('my_handwriting.json', test_dataset)  # collect.html output
+params = GenerationParams(do_sample=True, guidance_scale=2.0, style_guidance_scale=2.0, structured=True)
+offsets = generate_paragraph(model, test_dataset, 'text to write in that style', params, style=style)
+fig, ax = plot_paragraph(offsets, 'text to write in that style', params=params)
+```
+
+Or from the CLI: `python sample.py --style_json my_handwriting.json --style_text "hello world" ...`.
+Train with `--style_words 3` (default; `0` disables and reproduces the legacy pipeline).
+Checkpoints also store an EMA (averaged) copy of the weights (`--ema_decay 0.999`) which
+is automatically preferred for sampling. With the current single-writer dataset, cloning
+captures geometric style (slant, proportions, stroke density). The same conditioning path
+can support full writer-identity cloning with a multi-writer corpus (IAM/BRUSH), provided
+training targets and references are sampled within each writer.
+
 ## Training and logging
 
 We use a Transformer architecture taken from Karpathy's [`makemore`](https://github.com/karpathy/makemore/blob/master/makemore.py) repo. This, is basically the GPT-2/GPT-3 architecture plus a few judicious simplifications (eg, slightly different GELU). We add cross-attention to this architecture in order to condition on the ASCII context information. As for training code, we again start from the [`makemore`](https://github.com/karpathy/makemore/blob/master/makemore.py) repo but add Weights and Biases for logging and sample visualization.
@@ -519,4 +549,3 @@ On this day I took visualization code from Zach's branch, refactored it a bit, a
 ### Progress March 31, 2025
 
 Nearly ready to submit paper and upload the blog post. Just [added a colab](https://colab.research.google.com/github/greydanus/cursivetransformer/blob/main/train_sample_visualize.ipynb) for training/sampling/visualizations.
-

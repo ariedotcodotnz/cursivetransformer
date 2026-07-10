@@ -5,6 +5,7 @@
 ########## IMPORTS AND A FEW GLOBAL VARIABLES ##########
 
 import math, os, sys, argparse, getpass
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -49,6 +50,13 @@ def get_all_args(use_argparse=True):
         'warmup_steps': (1000, int, 'Linear LR warmup steps (cosine schedule only)'),
         'grad_clip': (1.0, float, 'Clip the gradient norm to this value (0 = no clipping)'),
         'n_context_layer': (2, int, 'Bidirectional encoder layers over the ASCII context (0 = raw char embeddings, as before)'),
+        # --- few-shot style adaptation (style cloning) ---
+        'style_words': (3, int, 'Words of same-writer handwriting given as a style reference (0 disables style conditioning)'),
+        'max_style_length': (600, int, 'Maximum style-reference length in stroke tokens'),
+        'n_style_tokens': (16, int, 'Number of pooled style memory tokens the decoder cross-attends to'),
+        'n_style_layer': (2, int, 'Bidirectional encoder layers over the style reference strokes'),
+        'style_drop_prob': (0.1, float, 'Prob. of dropping the style condition during training (enables style CFG)'),
+        'ema_decay': (0.999, float, 'EMA decay for an averaged copy of the weights used at eval/sample time (0 disables)'),
         'num_workers': (4, int, 'DataLoader worker processes for the training loader'),
         'alphabet': (" enaitoshrdx.vpukbgfcymzw1lqj804I92637OTAS5N)EHR\"\'(BCQLMWYU,ZF!DXV?KPGJ", str,
                         'All the characters that this model will be able to draw'),
@@ -59,6 +67,8 @@ def get_all_args(use_argparse=True):
         'wandb_api_key': (None, str, 'Weights & Biases API Key'),
         'load_from_run_id': (None, str, 'Load from a specific W&B run ID'),
         'local_checkpoint_path': ('best_checkpoint.pt', str, 'Path to local model file'),
+        'style_json': (None, str, 'Path to a .json/.json.zip handwriting sample to clone the style of (sample.py only)'),
+        'style_text': (None, str, 'Text to write when cloning a style with --style_json'),
     }
 
     if use_argparse:
@@ -85,7 +95,8 @@ def get_all_args(use_argparse=True):
 # Architecture-defining args. Stamped into every checkpoint so that loading can
 # rebuild the exact trained model even if the caller's args disagree.
 ARCH_KEYS = ('n_layer', 'n_embd', 'n_embd_context', 'n_ctx_head', 'n_context_layer',
-             'vocab_size', 'block_size', 'context_block_size', 'context_vocab_size')
+             'vocab_size', 'block_size', 'context_block_size', 'context_vocab_size',
+             'style_words', 'max_style_length', 'n_style_tokens', 'n_style_layer')
 
 
 def configure_optimizer(model, args):
@@ -100,6 +111,42 @@ def configure_optimizer(model, args):
     groups = [{'params': decay, 'weight_decay': args.weight_decay},
               {'params': no_decay, 'weight_decay': 0.0}]
     return torch.optim.AdamW(groups, lr=args.learning_rate, betas=(0.9, 0.99), eps=1e-8)
+
+
+class EMA:
+    """Exponential moving average of the model weights (Polyak averaging). Evaluating
+    and sampling from the averaged weights is a standard generative-modeling trick
+    that smooths late-training oscillation and reliably improves sample quality."""
+
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()
+                       if v.dtype.is_floating_point}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].lerp_(v.detach(), 1.0 - self.decay)
+
+    def state_dict(self):
+        return self.shadow
+
+    def load_state_dict(self, sd):
+        for k in self.shadow:
+            if k in sd:
+                self.shadow[k].copy_(sd[k])
+
+    @contextmanager
+    def swap(self, model):
+        """Temporarily load the EMA weights into the model (for eval/sampling)."""
+        backup = {k: v.detach().clone() for k, v in model.state_dict().items()
+                  if k in self.shadow}
+        model.load_state_dict(self.shadow, strict=False)
+        try:
+            yield
+        finally:
+            model.load_state_dict(backup, strict=False)
 
 
 def configure_scheduler(optimizer, args):
@@ -134,10 +181,16 @@ def get_checkpoint(args, sample_only):
             sys.exit()
 
     if checkpoint is not None:
-        for k, v in checkpoint.get('model_args', {}).items():
+        model_args = checkpoint.get('model_args', {})
+        for k, v in model_args.items():
             if getattr(args, k, None) != v:
                 print(f"Checkpoint architecture override: args.{k} = {v} (was {getattr(args, k, None)})")
                 setattr(args, k, v)
+        # A stamped checkpoint that predates style conditioning was trained without a
+        # style encoder; force it off so the module list matches the stored weights.
+        if model_args and 'style_words' not in model_args and getattr(args, 'style_words', 0) > 0:
+            print("Checkpoint predates style conditioning: args.style_words = 0")
+            args.style_words = 0
 
     model = MatFormer(args)
     model.to(args.device)
@@ -152,18 +205,26 @@ def get_checkpoint(args, sample_only):
 
     step = 0
     best_loss = None
+    ema_state = None
 
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model_state_dict'])
+        ema_state = checkpoint.get('ema_state_dict')
         if not sample_only:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             step = checkpoint['step'] + (1 if from_wandb else 0)
             best_loss = checkpoint['best_loss']
         if from_wandb:
-            save_checkpoint(model, args.local_checkpoint_path, optimizer, scheduler, step, best_loss)
+            # Preserve the complete downloaded checkpoint. Rebuilding it here would
+            # drop optimizer state during sample-only loads and could cache EMA
+            # parameters as the raw training weights.
+            torch.save(checkpoint, args.local_checkpoint_path)
+        if sample_only and ema_state is not None:
+            model.load_state_dict(ema_state, strict=False)  # EMA weights sample better
+            print("Loaded EMA (averaged) weights for sampling")
 
-    return model, optimizer, scheduler, step, best_loss
+    return model, optimizer, scheduler, step, best_loss, ema_state
 
 
 
@@ -184,7 +245,7 @@ def get_latest_checkpoint_artifact(args, verbose=True):
     return latest_artifact
 
 
-def save_checkpoint(model, path, optimizer=None, scheduler=None, step=None, best_loss=None):
+def save_checkpoint(model, path, optimizer=None, scheduler=None, step=None, best_loss=None, ema=None):
     checkpoint = {'model_state_dict': model.state_dict()}
     cfg = getattr(model, 'config', None)
     if cfg is not None:  # stamp the architecture so loading can never mismatch it
@@ -197,6 +258,8 @@ def save_checkpoint(model, path, optimizer=None, scheduler=None, step=None, best
         checkpoint['step'] = step
     if best_loss is not None:
         checkpoint['best_loss'] = best_loss
+    if ema is not None:  # accepts an EMA object or a raw state dict
+        checkpoint['ema_state_dict'] = ema.state_dict() if hasattr(ema, 'state_dict') and not isinstance(ema, dict) else ema
     torch.save(checkpoint, path)
 
 
@@ -306,10 +369,11 @@ class CrossAttention(nn.Module):
         attn_mask = None
         if context_mask is not None:
             # context_mask: (B, T_ctx) bool, True = real char (attend), False = PAD.
-            # Rows that are entirely PAD (the CFG "null" condition) are unmasked so
-            # softmax stays well-defined and gives a consistent unconditional signal.
+            # Keep one stable sentinel for entirely-PAD CFG rows. Unmasking every
+            # position would make the result depend on appended masked style slots.
             keep = context_mask.clone()
-            keep[~keep.any(dim=1)] = True
+            empty = ~keep.any(dim=1)
+            keep[empty, 0] = True
             attn_mask = keep.view(B, 1, 1, T_ctx)
 
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
@@ -359,7 +423,8 @@ class EncoderSelfAttention(nn.Module):
         attn_mask = None
         if key_mask is not None:
             keep = key_mask.clone()
-            keep[~keep.any(dim=1)] = True  # all-PAD (CFG null) rows attend everywhere
+            empty = ~keep.any(dim=1)
+            keep[empty, 0] = True  # stable sentinel for all-PAD CFG rows
             attn_mask = keep.view(B, 1, 1, T)
 
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
@@ -381,6 +446,49 @@ class EncoderBlock(nn.Module):
         x = x + self.attn(self.ln_1(x), key_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
+
+
+class StyleEncoder(nn.Module):
+    """Few-shot style adaptation: encode a reference stroke-token sequence (a few words
+    of someone's handwriting) into a small set of style memory tokens that the decoder
+    cross-attends to alongside the text context (cf. writer-style memory in SDT, Dai
+    et al. 2023, and CASHG, Shin et al. 2026; pooling is a Flamingo-style resampler:
+    learned queries attending over the encoded reference). Trained with
+    style-consistent augmentation, these tokens carry slant / proportions / stroke
+    density, so at inference the model can mimic the style of an unseen sample."""
+
+    def __init__(self, config):
+        super().__init__()
+        d = config.n_embd_context
+        self.proj = nn.Linear(config.n_embd, d)
+        self.spe = nn.Embedding(config.max_style_length, d)  # style positions (pairs theta/r)
+        self.blocks = nn.ModuleList([EncoderBlock(config) for _ in range(config.n_style_layer)])
+        self.ln = RMSNorm(d)
+        self.queries = nn.Parameter(torch.randn(config.n_style_tokens, d) * 0.02)
+        self.pool = nn.MultiheadAttention(d, config.n_ctx_head, batch_first=True)
+        self.ln_out = RMSNorm(d)
+
+    def forward(self, style_emb, key_mask):
+        """style_emb: (B, Ls, n_embd) embedded style tokens; key_mask: (B, Ls) bool,
+        True = real token. Returns (B, n_style_tokens, d) memory and its (B, n_style_tokens)
+        mask (all-False rows for null-style examples, so cross-attention ignores them)."""
+        B, Ls, _ = style_emb.size()
+        pos = torch.arange(Ls, device=style_emb.device)
+        x = self.proj(style_emb) + self.spe(pos).unsqueeze(0)
+
+        keep = key_mask.clone()
+        empty = ~keep.any(dim=1)      # rows with no style (dropped / null condition)
+        keep[empty, 0] = True         # keep attention well-defined for those rows
+        for block in self.blocks:
+            x = block(x, keep)
+        x = self.ln(x)
+
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)
+        out, _ = self.pool(q, x, x, key_padding_mask=~keep, need_weights=False)
+        out = self.ln_out(out)
+        out = out.masked_fill(empty.view(B, 1, 1), 0.0)  # null-style rows contribute nothing
+        style_mask = (~empty).view(B, 1).expand(B, self.queries.size(0))
+        return out, style_mask
 
 
 class Block(nn.Module):
@@ -433,6 +541,11 @@ class Transformer(nn.Module):
         if n_enc > 0:  # small bidirectional encoder contextualizes the ASCII chars
             self.transformer['henc'] = nn.ModuleList([EncoderBlock(config) for _ in range(n_enc)])
             self.transformer['ln_enc'] = RMSNorm(config.n_embd_context)
+        self.use_style = getattr(config, 'style_words', 0) > 0
+        if self.use_style:  # few-shot style adaptation from reference strokes
+            self.transformer['style_enc'] = StyleEncoder(config)
+        # The stroke-stream PAD token is always vocab_size - 3 (PAD, END, WORD tail).
+        self.stroke_pad_token = getattr(config, 'stroke_pad_token', config.vocab_size - 3)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight  # weight tying
 
@@ -468,7 +581,7 @@ class Transformer(nn.Module):
             self._rope_len = length
         return self._rope_cache
 
-    def forward(self, idx, context, targets=None):
+    def forward(self, idx, context, targets=None, style=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
@@ -483,6 +596,15 @@ class Transformer(nn.Module):
             for eblock in self.transformer.henc:
                 c = eblock(c, context_mask)
             c = self.transformer.ln_enc(c)
+
+        # Few-shot style adaptation: pool the reference strokes into style memory
+        # tokens and append them to the cross-attention context (masked per row).
+        if self.use_style and style is not None and style.numel() > 0:
+            style = style[:, :self.transformer.style_enc.spe.num_embeddings]
+            style_key_mask = (style != self.stroke_pad_token)
+            s_tokens, s_mask = self.transformer.style_enc(self.transformer.wte(style), style_key_mask)
+            c = torch.cat([c, s_tokens], dim=1)
+            context_mask = torch.cat([context_mask, s_mask], dim=1)
 
         rope = self._get_rope(t, device, x.dtype)
         for block in self.transformer.h:

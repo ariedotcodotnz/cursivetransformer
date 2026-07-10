@@ -3,6 +3,7 @@
 ########## IMPORTS AND A FEW GLOBAL VARIABLES ##########
 
 import os, sys, time, getpass, random
+from contextlib import nullcontext
 from typing import Optional
 from dataclasses import dataclass
 
@@ -15,7 +16,7 @@ from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from model import get_checkpoint, save_checkpoint, get_all_args
+from model import get_checkpoint, save_checkpoint, get_all_args, EMA
 from sample import save_samples
 from data import InfiniteDataLoader, create_datasets
 
@@ -29,8 +30,8 @@ def evaluate(model, dataset, batch_size=15, max_batches=None):
     losses = []
     for i, batch in enumerate(loader):
         batch = [t.to(args.device) for t in batch]
-        X, C, Y = batch
-        logits, loss = model(X, C, Y)
+        X, C, Y, S = batch
+        logits, loss = model(X, C, Y, style=S if S.numel() else None)
         losses.append(loss.item())
         if max_batches is not None and i >= max_batches:
             break
@@ -64,7 +65,10 @@ if __name__ == '__main__':
     args.context_vocab_size = train_dataset.get_char_vocab_size()
     print(f"Dataset determined that: {args.vocab_size=}, {args.block_size=}")
 
-    model, optimizer, scheduler, step, best_loss = get_checkpoint(args, sample_only=False)
+    model, optimizer, scheduler, step, best_loss, ema_state = get_checkpoint(args, sample_only=False)
+    ema = EMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None and ema_state is not None:
+        ema.load_state_dict(ema_state)
     batch_loader = InfiniteDataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=args.num_workers)
 
     wandb.watch(model, log="all", log_freq=args.log_every, log_graph=False)  # model saving stuff
@@ -78,7 +82,8 @@ if __name__ == '__main__':
 
         # get the next batch, ship to device, and unpack it to input and target
         batch = batch_loader.next()
-        X, C, Y = [t.to(args.device) for t in batch]
+        X, C, Y, S = [t.to(args.device) for t in batch]
+        S = S if S.numel() else None
 
         # Classifier-free guidance: randomly drop the ASCII condition (replace with the
         # null/all-PAD context) so the model also learns the unconditional distribution.
@@ -88,6 +93,15 @@ if __name__ == '__main__':
             if drop.any():
                 C = C.clone()
                 C[drop] = 0  # char_PAD_TOKEN -> the null condition
+
+        # Style CFG: independently drop the style reference (all-PAD) so the model also
+        # learns the style-unconditional distribution; at sample time we can push toward
+        # the reference style with a separate style guidance scale.
+        if S is not None and args.style_drop_prob > 0:
+            drop = torch.rand(S.size(0), device=S.device) < args.style_drop_prob
+            if drop.any():
+                S = S.clone()
+                S[drop] = train_dataset.PAD_TOKEN  # all-PAD -> the null style
 
         # MatFormer granularity for this step (see --subnetwork_mode)
         if args.subnetwork_mode == 'random':
@@ -99,13 +113,15 @@ if __name__ == '__main__':
         model.configure_subnetwork(flag)
 
         # feed into the model
-        logits, loss = model(X, C, Y)
+        logits, loss = model(X, C, Y, style=S)
 
         # calculate the gradient, clip it, update the weights
         model.zero_grad(set_to_none=True) ; loss.backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step() ; scheduler.step()
+        if ema is not None:
+            ema.update(model)
         wandb.log({"train_loss_step": loss.item(), "step": step})
         t1 = time.time()
 
@@ -113,27 +129,29 @@ if __name__ == '__main__':
         if step % args.print_every == 0:
             print(f"step {step} | loss {loss.item():.4f} | step time {(t1-t0)*1000:.2f}ms | lr {scheduler.get_last_lr()[0]:.6f}")
 
-        # evaluate the model
+        # evaluate the model (with EMA weights when enabled: those are what we ship)
         if step > 0 and step % args.log_every == 0:
-            train_loss = evaluate(model, train_dataset, batch_size=100, max_batches=10)
-            test_loss  = evaluate(model, test_dataset,  batch_size=100, max_batches=10)
+            with (ema.swap(model) if ema is not None else nullcontext()):
+                train_loss = evaluate(model, train_dataset, batch_size=100, max_batches=10)
+                test_loss  = evaluate(model, test_dataset,  batch_size=100, max_batches=10)
             wandb.log({"train_loss": train_loss, "test_loss": test_loss, "step": step })
             print(f"step {step} train loss: {train_loss:.4f} test loss: {test_loss:.4f}")
 
             if best_loss is None or test_loss < best_loss:  # save the model to W&B if it has improved
                 best_loss = test_loss
                 print(f"Test loss {test_loss:.4f} is the best so far, saving checkpoint to {args.local_checkpoint_path}")
-                save_checkpoint(model, args.local_checkpoint_path, optimizer, scheduler, step, best_loss)
+                save_checkpoint(model, args.local_checkpoint_path, optimizer, scheduler, step, best_loss, ema=ema)
                 artifact = wandb.Artifact('best_checkpoint', type='model')
                 artifact.add_file(args.local_checkpoint_path)
                 wandb.log_artifact(artifact)
 
-        # sample from the model
+        # sample from the model (EMA weights when enabled)
         if step > 0 and step % args.log_every == 0:
-            save_samples(model, test_dataset, num=6, do_sample=True)
-            save_samples(model, test_dataset, num=6, do_sample=False)
-            save_samples(model, train_dataset, num=3, do_sample=True)
-            save_samples(model, train_dataset, num=3, do_sample=False)
+            with (ema.swap(model) if ema is not None else nullcontext()):
+                save_samples(model, test_dataset, num=6, do_sample=True)
+                save_samples(model, test_dataset, num=6, do_sample=False)
+                save_samples(model, train_dataset, num=3, do_sample=True)
+                save_samples(model, train_dataset, num=3, do_sample=False)
 
         step += 1
         # termination conditions

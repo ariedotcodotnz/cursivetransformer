@@ -114,6 +114,31 @@ def random_horizontal_shear(stroke, shear_range=(-0.4, 0.4)):
     stroke[:, :2] = np.dot(stroke[:, :2], shear_matrix.T)
     return stroke
 
+
+########## STYLE-CONSISTENT AUGMENTATION (few-shot style adaptation) ##########
+# When style conditioning is on (args.style_words > 0) we draw ONE set of style
+# parameters per example and apply it to BOTH the style-reference words and the
+# target words. The style encoder can then learn to read slant / proportions /
+# stroke density off the reference strokes, which is exactly the skill needed to
+# mimic a new writer's sample at inference time. The ranges are deliberately wider
+# than the legacy augmentation so the style code carries real information.
+
+def sample_style_params(args):
+    return {
+        'shear': np.random.uniform(-0.45, 0.25),
+        'scale_x': np.random.uniform(0.85, 1.2),
+        'scale_y': np.random.uniform(0.85, 1.2),
+        'downsample_frac': args.downsample_mean + args.downsample_width * (np.random.rand() - .5),
+    }
+
+
+def apply_style_params(stroke, params):
+    shear_matrix = np.array([[1, params['shear']], [0, 1]])
+    stroke[:, :2] = np.dot(stroke[:, :2], shear_matrix.T)
+    stroke[:, 0:1] *= params['scale_x']
+    stroke[:, 1:2] *= params['scale_y']
+    return downsample(stroke, params['downsample_frac'])
+
 def random_rotate(stroke, angle_range=(-.08, .08)):
     angle = np.random.uniform(*angle_range)
     rad = np.deg2rad(angle)
@@ -152,7 +177,8 @@ def downsample(arr, fraction, drop_prob=0.05):
 
 
 class StrokeDataset(Dataset):
-    def __init__(self, raw_word_strokes, texts, args, max_text_length=50, name=''):
+    def __init__(self, raw_word_strokes, texts, args, max_text_length=50, name='',
+                 style_word_strokes=None):
         self.raw_word_strokes = raw_word_strokes  # List of lists of Nx3 arrays, each inner list representing words in a sentence
         self.texts = texts      # List of corresponding text strings
         self.args = args
@@ -162,6 +188,12 @@ class StrokeDataset(Dataset):
         self.max_text_length = max_text_length
         self.name = name
         self.counter = 0
+
+        # Style reference words (few-shot style adaptation). Parallel to
+        # raw_word_strokes: for each example, a list of OTHER words by the same writer
+        # that will receive the SAME style params as the target words.
+        self.style_word_strokes = style_word_strokes
+        self.max_style_length = getattr(args, 'max_style_length', 0) if getattr(args, 'style_words', 0) > 0 else 0
 
         self.theta_bins = np.linspace(-np.pi, np.pi, 220)
 
@@ -199,7 +231,10 @@ class StrokeDataset(Dataset):
         return np.concatenate([np.concatenate([tokens, word_tokens]) if i < len(token_lists)-1 else tokens 
                              for i, tokens in enumerate(token_lists)])
 
-    def augment_stroke(self, stroke):
+    def augment_stroke(self, stroke, style_params=None):
+        if style_params is not None:  # style-consistent path: shared params per example
+            return apply_style_params(stroke, style_params)
+        # legacy per-word augmentation (style conditioning off)
         # stroke = random_horizontal_shear(stroke, shear_range=(-0.30, 0.15)) # Horizontal shear
         stroke = random_horizontal_shear(stroke, shear_range=(-0.22, -0.18))
         stroke[:, 0:1] *= np.random.uniform(0.9, 1.1)
@@ -224,6 +259,22 @@ class StrokeDataset(Dataset):
 
     def get_text_seq_length(self):
         return self.max_text_length
+
+    def get_style_seq_length(self):
+        return self.max_style_length
+
+    def encode_style_words(self, word_strokes):
+        """Tokenize a list of word stroke arrays into a fixed-length style-reference
+        sequence (same vocab as the main stroke stream, PAD-padded / truncated)."""
+        encoded = [self.encode_stroke(
+                   strokes_to_offsets(word_strokes[i],
+                   prev_points=word_strokes[i-1] if i > 0 else None))
+                        for i in range(len(word_strokes))]
+        tokens = self.concat_with_word_tokens(encoded) if encoded else np.zeros(0, dtype=np.int64)
+        s = torch.full((self.max_style_length,), self.PAD_TOKEN, dtype=torch.long)
+        n = min(len(tokens), self.max_style_length)
+        s[:n] = torch.tensor(tokens[:n], dtype=torch.long)
+        return s
 
     def encode_stroke(self, stroke):
         # Encode magnitude and pen state together
@@ -290,11 +341,17 @@ class StrokeDataset(Dataset):
     def __getitem__(self, idx):
         word_strokes = self.raw_word_strokes[idx]
         text = self.texts[idx]
+        use_style = self.max_style_length > 0 and self.style_word_strokes is not None
+        style_words = self.style_word_strokes[idx] if use_style else []
 
         # Apply augmentation per word if enabled
         if self.augment:
             np.random.seed(self.args.seed+idx+self.counter)  # use the same augmentation across all words in sample
-            word_strokes = [self.augment_stroke(word.copy()) for word in word_strokes]
+            # With style conditioning on, ONE set of style params is shared by the
+            # reference words and the target words, so the reference is informative.
+            style_params = sample_style_params(self.args) if use_style else None
+            word_strokes = [self.augment_stroke(word.copy(), style_params) for word in word_strokes]
+            style_words = [self.augment_stroke(word.copy(), style_params) for word in style_words]
         self.counter = (self.counter + 1) % 100000
 
         # Encode each word separately and combine with WORD_TOKENs
@@ -322,7 +379,11 @@ class StrokeDataset(Dataset):
         y[seq_len:tail_end] = self.PAD_TOKEN
 
         c = self.encode_text(text)
-        return x, c, y
+        # Style tensor comes LAST so legacy (x, c, y) index-based unpacking still works;
+        # it is zero-length when style conditioning is off.
+        s = self.encode_style_words(style_words) if use_style \
+            else torch.zeros(0, dtype=torch.long)
+        return x, c, y, s
 
 
 def create_datasets(args):
@@ -335,19 +396,30 @@ def create_datasets(args):
   train_words = [data[i] for i in rp[:-test_set_size]]
   test_words = [data[i] for i in rp[-test_set_size:]]
 
+  n_style_words = getattr(args, 'style_words', 0)
+
   def build_split(words, num_combos):
       # Combos hold REFERENCES to the base word arrays rather than copies; __getitem__
       # copies a word only when augmenting it. This turns dataset construction from
       # minutes + tens of GB (497k examples x num_words deep copies) into seconds.
       print(f'For a dataset of {len(words)} examples we can generate {comb(len(words), args.num_words)} combinations of {args.num_words} examples.')
       print(f'Generating {num_combos} random combinations.')
-      ixs = sample_combo_indices(len(words), num_combos, args.num_words)
+      # Draw targets and references together so each reference is a distinct
+      # "other" word and cannot leak a target example into the style input.
+      row_width = args.num_words + n_style_words
+      all_ixs = sample_combo_indices(len(words), num_combos, row_width)
+      ixs = all_ixs[:, :args.num_words]
       word_strokes = [[words[j]['points'] for j in row] for row in ixs]
       texts = [' '.join(words[j]['metadata']['asciiSequence'] for j in row) for row in ixs]
-      return word_strokes, texts
 
-  train_word_strokes, train_texts = build_split(train_words, args.train_size)
-  test_word_strokes, test_texts = build_split(test_words, args.test_size)
+      style_strokes = None
+      if n_style_words > 0:  # a few OTHER words by the same writer, as style reference
+          style_ixs = all_ixs[:, args.num_words:]
+          style_strokes = [[words[j]['points'] for j in row] for row in style_ixs]
+      return word_strokes, texts, style_strokes
+
+  train_word_strokes, train_texts, train_style = build_split(train_words, args.train_size)
+  test_word_strokes, test_texts, test_style = build_split(test_words, args.test_size)
 
   print(f"Number of examples in the train dataset: {len(train_word_strokes)}")
   print(f"Number of examples in the test dataset: {len(test_word_strokes)}")
@@ -359,9 +431,42 @@ def create_datasets(args):
   print(f"Split up the dataset into {len(train_word_strokes)} training examples and {len(test_word_strokes)} test examples")
 
   # wrap in dataset objects
-  train_dataset = StrokeDataset(train_word_strokes, train_texts, args, name='train')
-  test_dataset = StrokeDataset(test_word_strokes, test_texts, args, name='test')
+  train_dataset = StrokeDataset(train_word_strokes, train_texts, args, name='train', style_word_strokes=train_style)
+  test_dataset = StrokeDataset(test_word_strokes, test_texts, args, name='test', style_word_strokes=test_style)
   return train_dataset, test_dataset
+
+
+########## LOADING A USER'S HANDWRITING AS A STYLE REFERENCE ##########
+
+def normalize_raw_examples(data):
+    """Apply the same normalization as load_and_parse_data to freshly captured
+    handwriting (e.g. the output of data/collect.html)."""
+    for item in data:
+        strokes = np.array(item['points'], dtype=np.float64)
+        strokes[:, 0] *= item['metadata']['aspectRatio']
+        strokes[:, 0] -= strokes[0, 0]
+        strokes[:, 1] -= 0.65
+        item['points'] = strokes
+    return data
+
+
+def load_style_reference(path, dataset):
+    """Load a few words/sentences of someone's handwriting and tokenize them into a
+    style-reference tensor of shape (1, max_style_length) for style-conditioned
+    generation. `path` is a .json or .json.zip file in the same format as the
+    training data (a list of {'points': Nx3, 'metadata': {...}} examples)."""
+    if path.endswith('.zip'):
+        with zipfile.ZipFile(path, 'r') as zip_ref:
+            with zip_ref.open(zip_ref.namelist()[0]) as file:
+                data = json.load(file)
+    else:
+        with open(path) as file:
+            data = json.load(file)
+    data = normalize_raw_examples(data)
+    word_arrays = [item['points'] for item in data]
+    assert dataset.max_style_length > 0, \
+        'This model was trained without style conditioning (style_words=0)'
+    return dataset.encode_style_words(word_arrays).unsqueeze(0)
 
 
 class InfiniteDataLoader:

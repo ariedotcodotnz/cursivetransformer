@@ -192,6 +192,42 @@ Replace dated `makemore`/GPT-2-isms with current standard transformer components
   lands at convergence (v2's best was trained at LR~0.0089, never saw low LR), and
   dropout 0.1 to delay the overfit. Everything else unchanged. ~45-50 min on A100.
   Beyond v3 the binding constraint is the 3,325-word base dataset, not training.
+- 2026-07-10 (few-shot style cloning + EMA — Tier 5 delivered): the model can now be
+  given a few words/sentences of someone's handwriting and write new text in that
+  style. Design (cf. SDT writer-style memory, CASHG style memories, Flamingo-style
+  resampler pooling):
+  1. data.py: style-consistent augmentation. With --style_words N (default 3), each
+     example gets N OTHER words by the same writer as a style reference, and ONE set
+     of widened style params (shear -0.45..0.25, x/y scale 0.85..1.2, downsample
+     density) is shared between reference and target words. The style encoder must
+     therefore read slant/proportions/stroke-density off the reference — exactly the
+     skill needed to mimic an unseen writer sample at inference. Dataset items are now
+     (x, c, y, s); s is zero-length when style is off (legacy indices unchanged).
+     load_style_reference() tokenizes a user's collect.html-style JSON into a style
+     reference tensor.
+  2. model.py: StyleEncoder — shared wte embedding -> proj -> learned style positions
+     -> n_style_layer bidirectional blocks -> attention pooling with n_style_tokens
+     (16) learned queries -> style memory concatenated with the text context for
+     cross-attention (per-row masks; null-style rows are provably identical to a
+     no-style forward — smoke-tested). Style keys stamped into ARCH_KEYS.
+  3. Style CFG: --style_drop_prob 0.1 independently drops the style condition during
+     training; generate() now does compositional guidance
+     logits = uncond + g_text*(text - uncond) + g_style*(text+style - text)
+     with a new style_guidance_scale knob (GenerationParams, default 1.5).
+  4. EMA (--ema_decay 0.999): averaged weights used for eval/sampling and stored in
+     the checkpoint (ema_state_dict); sample_only loads prefer them. get_checkpoint
+     now returns a 6th value (ema_state).
+  5. wandb_report.py: fetches a W&B run (defaults to cursivetransformer-ng/.../bxf7fmpq),
+     prints run.history(), best/last losses, and saves a loss-curve PNG.
+  All smoke-tested on CPU (style shapes, null-style==no-style equivalence, style
+  changes logits, dual-CFG sampling incl. broadcast of a single reference across a
+  batch, style_words=0 legacy path, EMA lerp/swap/checkpoint round-trip, 120-step
+  overfit run: loss 6.23 -> 1.26). Notebook updated (style/EMA flags + a "clone
+  someone's handwriting" upload cell). NOTE: requires training from scratch with
+  style_words > 0 to use cloning; single-writer data limits cloning to geometric
+  style (slant/proportions/density) — a multi-writer dataset (IAM/BRUSH), sampled so
+  each target/reference group belongs to one writer, can use the same conditioning
+  path for full writer-identity cloning.
 - 2026-06-10 (regen "word vanishes" bug): regenerating a word could drop it entirely.
   Cause: a stray WORD token at the start of the regenerated chunk creates an EMPTY
   word group; truncation to the expected word count then puts the empty group in the

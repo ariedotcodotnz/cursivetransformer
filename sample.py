@@ -27,6 +27,8 @@ class GenerationParams:
     top_p: float = 0.95            # nucleus sampling; set to None/1.0 to disable
     guidance_scale: float = 1.5    # classifier-free guidance; >1 sharpens text adherence
                                    # (also used for the W&B training previews)
+    style_guidance_scale: float = 1.5  # style CFG; >1 pushes harder toward the reference
+                                       # style (only used when a style reference is given)
     structured: bool = True        # mask out tokens that violate the (theta, r) pair structure
     do_sample: bool = False
     num_steps: int = 1050
@@ -126,18 +128,28 @@ def _filter_logits(logits, temperature, top_k, top_p):
 
 @torch.no_grad()
 def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=False,
-             top_k=None, top_p=None, guidance_scale=1.0, structured=False, dataset=None):
+             top_k=None, top_p=None, guidance_scale=1.0, structured=False, dataset=None,
+             style=None, style_guidance_scale=1.0):
     """
     Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
     the sequence max_new_tokens times, feeding the predictions back into the model each time.
     Supports nucleus sampling (top_p), classifier-free guidance (guidance_scale > 1), and
     structured masking that forbids tokens which would break the (theta, r) pairing.
+    `style` is an optional (b or 1, Ls) style-reference token tensor; compositional CFG
+    (Liu et al. 2022-style) then guides text and style independently:
+        logits = uncond + g_text*(text - uncond) + g_style*(text+style - text)
     Make sure the model is in eval() mode.
     """
     if hasattr(model, 'configure_subnetwork'):
         model.configure_subnetwork('xl')  # always sample from the full model
 
-    use_cfg = guidance_scale is not None and guidance_scale != 1.0
+    use_style = style is not None and getattr(model, 'use_style', False)
+    if use_style and style.size(0) == 1 and idx.size(0) > 1:
+        style = style.expand(idx.size(0), -1)  # one reference shared across the batch
+    g_text = 1.0 if guidance_scale is None else guidance_scale
+    g_style = 1.0 if style_guidance_scale is None else style_guidance_scale
+    use_cfg = g_text != 1.0
+    use_style_cfg = use_style and g_style != 1.0
     null_context = torch.zeros_like(context) if use_cfg else None  # all-PAD == unconditional
 
     # Stop each sequence at its END token. The model has no training signal for what
@@ -159,13 +171,22 @@ def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=Fal
         # if the sequence context is growing too long we must crop it at block_size
         idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
         # forward the model to get the logits for the index in the sequence
-        logits, _ = model(idx_cond, context)
-        logits = logits[:, -1, :]
+        logits, _ = model(idx_cond, context, style=style) if use_style else model(idx_cond, context)
+        logits = logits[:, -1, :]  # text (+ style) conditioned
+
+        if use_style_cfg or (use_style and use_cfg):
+            # text-only logits anchor the style guidance term (and the text term below)
+            text_logits, _ = model(idx_cond, context)
+            text_logits = text_logits[:, -1, :]
+            logits = text_logits + g_style * (logits - text_logits)
+        else:
+            text_logits = logits if not use_style else None
 
         if use_cfg:  # extrapolate away from the unconditional distribution
             uncond_logits, _ = model(idx_cond, null_context)
             uncond_logits = uncond_logits[:, -1, :]
-            logits = uncond_logits + guidance_scale * (logits - uncond_logits)
+            anchor = text_logits if text_logits is not None else logits
+            logits = logits + (g_text - 1.0) * (anchor - uncond_logits)
 
         if structured and dataset is not None:  # forbid structure-violating tokens
             valid = _structured_mask(idx, dataset)
@@ -194,18 +215,21 @@ def save_samples(model, dataset, num=2, model_device='cpu', warmup_steps=50, do_
     model_device = next(model.parameters()).device
     params = params if params else GenerationParams()
 
-    stroke_seq, context = [], []
+    stroke_seq, context, styles = [], [], []
     for i in range(num):
-      x, c, y = dataset[i]
-      stroke_seq.append(x) ; context.append(c)
+      x, c, y, s = dataset[i]
+      stroke_seq.append(x) ; context.append(c) ; styles.append(s)
 
     X_init = torch.stack(stroke_seq).to(model_device)[:,:warmup_steps]
     context = torch.stack(context).long().to(model_device)
+    style = torch.stack(styles).long().to(model_device)
+    style = style if style.numel() else None
     steps = dataset.get_stroke_seq_length() - 1  # -1 because we already start with the first token
 
     X_samp = generate(model, X_init, context, steps, temperature=params.temperature,
                       top_k=params.top_k, top_p=params.top_p, guidance_scale=params.guidance_scale,
-                      structured=params.structured, dataset=dataset, do_sample=do_sample).to('cpu')
+                      structured=params.structured, dataset=dataset, do_sample=do_sample,
+                      style=style, style_guidance_scale=params.style_guidance_scale).to('cpu')
 
     for i in range(X_samp.size(0)):
         # get the i'th row of sampled integers, as python list
@@ -227,12 +251,12 @@ def save_samples(model, dataset, num=2, model_device='cpu', warmup_steps=50, do_
     print('-'*80)
 
 
-def generate_helper_fn(model, dataset, word_list, params):
+def generate_helper_fn(model, dataset, word_list, params, style=None):
     model_device = next(model.parameters()).device
     warmup_sample_ix = params.warmup_sample_ix if params.warmup_sample_ix else torch.randint(len(dataset), (1,)).item()
     if params.verbose: print(f' (warmup_sample_ix={warmup_sample_ix})')
 
-    seed_x, seed_c, _ = dataset[warmup_sample_ix]  # Get seed tokens and text from dataset
+    seed_x, seed_c = dataset[warmup_sample_ix][:2]  # Get seed tokens and text from dataset
     word_tokens = dataset.split_by_word_tokens(seed_x)  # Get just first word tokens
     first_word_tokens = torch.tensor(word_tokens[0])
     first_word_tokens = torch.cat([first_word_tokens, torch.tensor([dataset.WORD_TOKEN])])  # Add word token
@@ -261,10 +285,14 @@ def generate_helper_fn(model, dataset, word_list, params):
     context = context.to(model_device)
     X_init = first_word_tokens.unsqueeze(0).to(model_device)
 
+    if style is not None:
+        style = style.to(model_device)
+
     steps = params.num_steps - X_init.size(1)
     X_samp = generate(model, X_init, context, steps, temperature=params.temperature,
                       top_k=params.top_k, top_p=params.top_p, guidance_scale=params.guidance_scale,
-                      structured=params.structured, dataset=dataset, do_sample=params.do_sample).to('cpu')
+                      structured=params.structured, dataset=dataset, do_sample=params.do_sample,
+                      style=style, style_guidance_scale=params.style_guidance_scale).to('cpu')
 
     stroke_seq = X_samp[0].detach().cpu().numpy()[warmup_steps:]
     offset_samp = dataset.decode_stroke(stroke_seq)
@@ -279,7 +307,9 @@ def generate_helper_fn(model, dataset, word_list, params):
     return ascii_context, offset_samp
 
 
-def generate_paragraph(model, dataset, text, params, word_list_offsets=None, regenerate_ixs=None):
+def generate_paragraph(model, dataset, text, params, word_list_offsets=None, regenerate_ixs=None, style=None):
+    """Generate a paragraph of handwriting. Pass `style` (a (1, Ls) style-reference
+    tensor from data.load_style_reference) to write it in that reference's style."""
     if word_list_offsets is None:  # fresh generation: reproducible from params.seed
         torch.manual_seed(params.seed)
         torch.cuda.manual_seed_all(params.seed)
@@ -293,7 +323,7 @@ def generate_paragraph(model, dataset, text, params, word_list_offsets=None, reg
         for i in range(0, len(word_list), params.n_at_a_time):
             word_list_subset = word_list[i:i+params.n_at_a_time]
             if params.verbose: print('   ', ' '.join(word_list_subset), end='')
-            ascii_context, offset_sample = generate_helper_fn(model, dataset, word_list_subset, params)
+            ascii_context, offset_sample = generate_helper_fn(model, dataset, word_list_subset, params, style=style)
             word_list_offsets += offset_sample[:len(word_list_subset)]
     else:
         # Regenerate specific words if requested
@@ -303,7 +333,7 @@ def generate_paragraph(model, dataset, text, params, word_list_offsets=None, reg
                 if i >= len(word_list):
                     continue
                 if params.verbose: print('   ', word_list[i], end='')
-                ascii_context, offset_sample = generate_helper_fn(model, dataset, [word_list[i]], params)
+                ascii_context, offset_sample = generate_helper_fn(model, dataset, [word_list[i]], params, style=style)
                 word_list_offsets[i] = offset_sample[0]
 
     return word_list_offsets
@@ -383,7 +413,19 @@ if __name__ == '__main__':
     args.context_vocab_size = train_dataset.get_char_vocab_size()
     print(f"Dataset determined that: {args.vocab_size=}, {args.block_size=}")
 
-    model, optimizer, scheduler, step, best_loss = get_checkpoint(args, sample_only=True)
+    model, optimizer, scheduler, step, best_loss, _ = get_checkpoint(args, sample_only=True)
+    model.eval()
+
+    if getattr(args, 'style_json', None):
+        # Style cloning: write a paragraph in the style of the provided handwriting sample.
+        from data import load_style_reference
+        style = load_style_reference(args.style_json, test_dataset)
+        params = GenerationParams(do_sample=True)
+        text = args.style_text or 'the quick brown fox jumps over the lazy dog'
+        offsets = generate_paragraph(model, test_dataset, text, params, style=style)
+        fig, ax = plot_paragraph(offsets, text, params=params, include_title=True)
+        fig.savefig('style_clone.png')
+        print('Saved style_clone.png')
 
     save_samples(model, test_dataset, num=6, do_sample=True, log_wandb=False)
     save_samples(model, test_dataset, num=6, do_sample=False, log_wandb=False)
