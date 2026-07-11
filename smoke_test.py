@@ -15,6 +15,8 @@ args.train_size, args.test_size = 16, 8
 args.batch_size = 4
 args.style_words, args.max_style_length = 2, 256  # style conditioning ON (small)
 args.n_style_tokens, args.n_style_layer = 8, 1
+args.use_bos = True
+args.style_lr_multiplier = 3.0
 
 # pick a dataset that exists and has enough examples
 for name in ['easybank', 'sample', 'cursive', 'bigbank']:
@@ -48,6 +50,23 @@ for flag in ['s', 'm', 'l', 'xl']:
     n_grad = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
     print(f"[{flag}] logits {tuple(logits.shape)} loss {loss.item():.4f} effparams {model.count_trainable_parameters():,} gradsum {n_grad:.2f}")
 assert logits.shape == (args.batch_size, args.max_seq_length, args.vocab_size)
+assert train_ds.use_bos and train_ds.BOS_TOKEN == args.vocab_size - 1
+assert (X[:, 0] == train_ds.BOS_TOKEN).all(), "v5 examples must start with BOS"
+
+# ---- cached decoding must be numerically identical to a full causal forward ----
+model.eval(); model.configure_subnetwork('xl')
+prefix_len = 12
+with torch.no_grad():
+    full_logits, _ = model(X[:1, :prefix_len], C[:1], style=S[:1])
+    cache, cached_steps = None, []
+    for pos in range(prefix_len):
+        step_logits, cache = model.forward_cached(
+            X[:1, pos:pos + 1], C[:1], style=S[:1], cache=cache)
+        cached_steps.append(step_logits[:, -1])
+cached_logits = torch.stack(cached_steps, dim=1)
+assert torch.allclose(full_logits, cached_logits, atol=2e-5, rtol=2e-4), \
+    "KV-cached logits differ from full decoding"
+print("[ok] BOS prefix + exact KV-cached decoding")
 
 # ---- style conditioning: shapes, dropped-style rows, and NaN safety ----
 assert S.shape == (args.batch_size, args.max_style_length)
@@ -69,6 +88,20 @@ assert torch.allclose(logits_joint_null, logits_uncond, atol=1e-5), \
 # and a real style reference must actually change the logits
 assert not torch.allclose(logits_s[1], logits_ns[1], atol=1e-4), "style condition had no effect"
 print("[ok] style conditioning: null-style==no-style, real style changes logits, no NaNs")
+
+# ---- validation is deterministic and exposes correct/no/shuffled style controls ----
+from train import evaluate
+import random as _random
+py_rng, torch_rng, counter_before = _random.getstate(), torch.get_rng_state(), train_ds.counter
+metrics_a = evaluate(model, train_ds, batch_size=2, max_batches=2,
+                     style_metrics=True, seed=123)
+metrics_b = evaluate(model, train_ds, batch_size=2, max_batches=2,
+                     style_metrics=True, seed=123)
+assert metrics_a == metrics_b
+assert {'loss', 'loss_no_style', 'loss_shuffled_style'} <= metrics_a.keys()
+assert _random.getstate() == py_rng and torch.equal(torch.get_rng_state(), torch_rng)
+assert train_ds.counter == counter_before
+print("[ok] deterministic correct/no/shuffled-style validation")
 
 # ---- style-consistent augmentation: ref and target share style params ----
 from data import sample_style_params, apply_style_params, load_style_reference
@@ -92,7 +125,7 @@ print("[ok] null/unconditional context forward")
 
 # ---- sampling: plain, nucleus, CFG, structured ----
 model.configure_subnetwork('xl')
-X_init = X[:, :8]
+X_init = X[:, :9]  # BOS plus four complete theta/r pairs
 for desc, kw in [
     ("greedy",         dict(do_sample=False)),
     ("nucleus",        dict(do_sample=True, top_p=0.9, temperature=0.8)),
@@ -142,6 +175,9 @@ v = _structured_mask(torch.tensor([[th0, r0, W]]), train_ds)
 assert v[0, W] and v[0].sum() == 1, "after a lone WORD token only its partner is legal"
 v = _structured_mask(torch.tensor([[th0, r0, W, W]]), train_ds)
 assert not v[0, W] and not v[0, train_ds.END_TOKEN] and v[0, th0], "after a WORD pair a stroke must start"
+v = _structured_mask(torch.tensor([[train_ds.BOS_TOKEN]]), train_ds)
+assert v[0, th0] and not v[0, train_ds.END_TOKEN] and not v[0, W], \
+    "BOS must be followed by a stroke"
 print("[ok] structured mask enforces WORD-token pairing")
 
 # ---- targets: END predicted after last real token, then a short supervised PAD tail ----
@@ -196,14 +232,15 @@ print("[ok] lazy combo references: base arrays unmutated after augmented __getit
 from model import get_checkpoint, save_checkpoint
 args.load_from_run_id = None
 m2, opt2, sched2, step2, bl2, ema_state2 = get_checkpoint(args, sample_only=False)
-assert len(opt2.param_groups) == 2 and opt2.param_groups[1]['weight_decay'] == 0.0
+assert len(opt2.param_groups) == 4 and opt2.param_groups[1]['weight_decay'] == 0.0
+assert opt2.param_groups[2]['initial_lr'] == args.learning_rate * args.style_lr_multiplier
 lrs = []
 for _ in range(3):
     logits2, loss2 = m2(X, C, Y)
     opt2.zero_grad(); loss2.backward(); opt2.step(); sched2.step()
     lrs.append(sched2.get_last_lr()[0])
 assert lrs[0] < lrs[1] < lrs[2] <= args.learning_rate, "cosine warmup should ramp the LR up"
-print(f"[ok] AdamW param groups (decay/no-decay) + cosine warmup (lr ramp {lrs[0]:.2e} -> {lrs[2]:.2e})")
+print(f"[ok] AdamW backbone/style param groups + cosine warmup (lr ramp {lrs[0]:.2e} -> {lrs[2]:.2e})")
 
 # ---- checkpoint stamps the architecture; mismatched args are overridden on load ----
 import os, tempfile, copy as _copy
@@ -232,13 +269,27 @@ print("[ok] n_context_layer=0 (no text encoder) still works")
 # ---- style conditioning can be disabled (style_words=0): legacy behavior ----
 args_nostyle = _copy.deepcopy(args)
 args_nostyle.style_words = 0
+args_nostyle.use_bos = False
 ds_ns, _ = create_datasets(args_nostyle)
+args_nostyle.vocab_size = ds_ns.get_vocab_size()
+args_nostyle.stroke_pad_token = ds_ns.PAD_TOKEN
 x_ns, c_ns, y_ns, s_ns = ds_ns[0]
 assert s_ns.numel() == 0, "style tensor should be zero-length when style is off"
+assert x_ns[0] != ds_ns.BOS_TOKEN and ds_ns.BOS_TOKEN is None
 m_ns = MatFormer(args_nostyle)
 assert not m_ns.use_style and not any('style_enc' in n for n, _ in m_ns.named_parameters())
 _ = m_ns(x_ns.unsqueeze(0), c_ns.unsqueeze(0), y_ns.unsqueeze(0), style=s_ns.unsqueeze(0))
 print("[ok] style_words=0 (no style encoder) reproduces legacy behavior")
+
+# ---- v3-compatible warm start copies the backbone and expands the BOS vocab row ----
+from model import load_compatible_weights
+m_warm = MatFormer(args)
+summary = load_compatible_weights(m_warm, m_ns.state_dict())
+assert summary['partial'], "BOS vocabulary expansion should produce partial tensor loads"
+assert torch.equal(m_warm.transformer.wte.weight[:args_nostyle.vocab_size],
+                   m_ns.transformer.wte.weight)
+assert any('style_enc' in name for name in m_warm.state_dict())
+print("[ok] legacy backbone warm-starts BOS/style v5 with partial vocab loading")
 
 # ---- EMA: updates track the weights; checkpoint round trip; sampling prefers EMA ----
 from model import EMA

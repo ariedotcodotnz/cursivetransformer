@@ -188,6 +188,7 @@ class StrokeDataset(Dataset):
         self.max_text_length = max_text_length
         self.name = name
         self.counter = 0
+        self.use_bos = getattr(args, 'use_bos', False)
 
         # Style reference words (few-shot style adaptation). Parallel to
         # raw_word_strokes: for each example, a list of OTHER words by the same writer
@@ -211,6 +212,7 @@ class StrokeDataset(Dataset):
         self.PAD_TOKEN = sum(self.feature_sizes)
         self.END_TOKEN = sum(self.feature_sizes) + 1
         self.WORD_TOKEN = sum(self.feature_sizes) + 2
+        self.BOS_TOKEN = sum(self.feature_sizes) + 3 if self.use_bos else None
 
         # Character tokenization
         self.char_PAD_TOKEN = 0
@@ -249,7 +251,14 @@ class StrokeDataset(Dataset):
         return len(self.raw_word_strokes)
 
     def get_vocab_size(self):
-        return sum(self.feature_sizes) + 3  # +3 for PAD, END, and WORD tokens
+        # BOS is opt-in so checkpoints trained before v5 keep their exact vocabulary.
+        return sum(self.feature_sizes) + 3 + int(self.use_bos)
+
+    def get_generation_prefix(self):
+        """Return the learned sequence prefix for free-running v5 generation."""
+        if not self.use_bos:
+            raise ValueError('This dataset was built without a BOS token')
+        return torch.tensor([self.BOS_TOKEN], dtype=torch.long)
 
     def get_char_vocab_size(self):
         return len(self.alphabet) + 1  # +1 for PAD token
@@ -305,8 +314,12 @@ class StrokeDataset(Dataset):
         if isinstance(ix, torch.Tensor):
             ix = ix.cpu().numpy()
 
-        # Remove PAD, END, and WORD tokens
-        ix = ix[(ix != self.PAD_TOKEN) & (ix != self.END_TOKEN) & (ix != self.WORD_TOKEN)]
+        # Remove sequence-control tokens before reconstructing theta/r pairs.
+        specials = ((ix == self.PAD_TOKEN) | (ix == self.END_TOKEN) |
+                    (ix == self.WORD_TOKEN))
+        if self.BOS_TOKEN is not None:
+            specials |= ix == self.BOS_TOKEN
+        ix = ix[~specials]
 
         # Reshape the flattened array back to Nx2
         ix = ix[:(len(ix)//2)*2]
@@ -367,16 +380,22 @@ class StrokeDataset(Dataset):
         x = torch.full((self.max_seq_length,), self.PAD_TOKEN, dtype=torch.long)
         y = torch.full((self.max_seq_length,), -1, dtype=torch.long)
 
-        seq_len = min(len(encoded_stroke), self.max_seq_length - 1)  # -1 to leave room for END token
-        x[:seq_len] = torch.tensor(encoded_stroke[:seq_len], dtype=torch.long)
-        x[seq_len] = self.END_TOKEN
+        prefix_len = int(self.use_bos)
+        seq_len = min(len(encoded_stroke), self.max_seq_length - prefix_len - 1)
+        if self.use_bos:
+            x[0] = self.BOS_TOKEN
+        x[prefix_len:prefix_len + seq_len] = torch.tensor(
+            encoded_stroke[:seq_len], dtype=torch.long)
+        end_pos = prefix_len + seq_len
+        x[end_pos] = self.END_TOKEN
 
-        y[:seq_len] = x[1:seq_len+1]  # the last real position's target is the END token
+        # BOS predicts the first theta token; the last real stroke token predicts END.
+        y[:end_pos] = x[1:end_pos + 1]
         # Teach the model to go quiet after END (END->PAD, then PAD->PAD) but only for a
         # few positions, so these easy PAD predictions don't flood the loss the way the
         # old full-PAD targets did. The rest of the tail stays -1 (ignored).
-        tail_end = min(self.max_seq_length, seq_len + 1 + 8)
-        y[seq_len:tail_end] = self.PAD_TOKEN
+        tail_end = min(self.max_seq_length, end_pos + 1 + 8)
+        y[end_pos:tail_end] = self.PAD_TOKEN
 
         c = self.encode_text(text)
         # Style tensor comes LAST so legacy (x, c, y) index-based unpacking still works;

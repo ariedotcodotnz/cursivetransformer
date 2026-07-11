@@ -50,6 +50,7 @@ def get_all_args(use_argparse=True):
         'warmup_steps': (1000, int, 'Linear LR warmup steps (cosine schedule only)'),
         'grad_clip': (1.0, float, 'Clip the gradient norm to this value (0 = no clipping)'),
         'n_context_layer': (2, int, 'Bidirectional encoder layers over the ASCII context (0 = raw char embeddings, as before)'),
+        'use_bos': (False, 'store_true', 'Train with a BOS token so generation needs no ground-truth handwriting prefix'),
         # --- few-shot style adaptation (style cloning) ---
         'style_words': (3, int, 'Words of same-writer handwriting given as a style reference (0 disables style conditioning)'),
         'max_style_length': (600, int, 'Maximum style-reference length in stroke tokens'),
@@ -57,6 +58,11 @@ def get_all_args(use_argparse=True):
         'n_style_layer': (2, int, 'Bidirectional encoder layers over the style reference strokes'),
         'style_drop_prob': (0.1, float, 'Prob. of dropping the style condition during training (enables style CFG)'),
         'ema_decay': (0.999, float, 'EMA decay for an averaged copy of the weights used at eval/sample time (0 disables)'),
+        'style_lr_multiplier': (1.0, float, 'Learning-rate multiplier for newly initialized style-encoder parameters'),
+        'eval_batch_size': (100, int, 'Validation batch size'),
+        'eval_max_batches': (-1, int, 'Maximum validation batches; <=0 evaluates the full split'),
+        'early_stopping_patience': (0, int, 'Stop after this many non-improving validations (0 disables)'),
+        'early_stopping_min_delta': (0.0, float, 'Minimum validation-loss decrease counted as an improvement'),
         'num_workers': (4, int, 'DataLoader worker processes for the training loader'),
         'alphabet': (" enaitoshrdx.vpukbgfcymzw1lqj804I92637OTAS5N)EHR\"\'(BCQLMWYU,ZF!DXV?KPGJ", str,
                         'All the characters that this model will be able to draw'),
@@ -66,6 +72,8 @@ def get_all_args(use_argparse=True):
         'wandb_run_name': ('unnamed_run', str, 'W&B run name'),
         'wandb_api_key': (None, str, 'Weights & Biases API Key'),
         'load_from_run_id': (None, str, 'Load from a specific W&B run ID'),
+        'init_from_run_id': (None, str, 'Warm-start a new model from compatible weights in this W&B run'),
+        'init_checkpoint_path': (None, str, 'Warm-start a new model from compatible weights in this local checkpoint'),
         'local_checkpoint_path': ('best_checkpoint.pt', str, 'Path to local model file'),
         'style_json': (None, str, 'Path to a .json/.json.zip handwriting sample to clone the style of (sample.py only)'),
         'style_text': (None, str, 'Text to write when cloning a style with --style_json'),
@@ -96,20 +104,32 @@ def get_all_args(use_argparse=True):
 # rebuild the exact trained model even if the caller's args disagree.
 ARCH_KEYS = ('n_layer', 'n_embd', 'n_embd_context', 'n_ctx_head', 'n_context_layer',
              'vocab_size', 'block_size', 'context_block_size', 'context_vocab_size',
-             'style_words', 'max_style_length', 'n_style_tokens', 'n_style_layer')
+             'style_words', 'max_style_length', 'n_style_tokens', 'n_style_layer',
+             'use_bos', 'stroke_pad_token', 'style_lr_multiplier')
 
 
 def configure_optimizer(model, args):
     """AdamW with standard weight-decay exclusions: no decay on biases, norm weights
     (dim < 2), or embeddings (incl. the tied wte/lm_head weight)."""
-    decay, no_decay = [], []
+    decay, no_decay, style_decay, style_no_decay = [], [], [], []
+    style_multiplier = getattr(args, 'style_lr_multiplier', 1.0)
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         is_embedding = 'wte' in name or 'wce' in name or 'wcpe' in name
-        (no_decay if (p.dim() < 2 or is_embedding) else decay).append(p)
+        no_wd = p.dim() < 2 or is_embedding
+        if style_multiplier != 1.0 and 'style_enc' in name:
+            (style_no_decay if no_wd else style_decay).append(p)
+        else:
+            (no_decay if no_wd else decay).append(p)
     groups = [{'params': decay, 'weight_decay': args.weight_decay},
               {'params': no_decay, 'weight_decay': 0.0}]
+    if style_decay or style_no_decay:
+        style_lr = args.learning_rate * style_multiplier
+        groups.extend([
+            {'params': style_decay, 'weight_decay': args.weight_decay, 'lr': style_lr},
+            {'params': style_no_decay, 'weight_decay': 0.0, 'lr': style_lr},
+        ])
     return torch.optim.AdamW(groups, lr=args.learning_rate, betas=(0.9, 0.99), eps=1e-8)
 
 
@@ -163,18 +183,64 @@ def configure_scheduler(optimizer, args):
     return torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_lr_every, gamma=args.lr_decay)
 
 
+def load_compatible_weights(model, state_dict):
+    """Warm-start matching weights while allowing newly added modules/vocab rows.
+
+    This is intentionally separate from resume loading: optimizer state and training
+    step are not restored, and incompatible architecture tensors stay initialized.
+    """
+    target = model.state_dict()
+    loaded, partial, skipped = [], [], []
+    with torch.no_grad():
+        for name, source in state_dict.items():
+            if name not in target:
+                skipped.append(name)
+                continue
+            dest = target[name]
+            if dest.shape == source.shape:
+                dest.copy_(source)
+                loaded.append(name)
+            elif (dest.ndim == source.ndim and dest.ndim > 0 and
+                  dest.shape[1:] == source.shape[1:]):
+                # Vocabulary expansion (for BOS) preserves every existing token row.
+                n = min(dest.shape[0], source.shape[0])
+                dest[:n].copy_(source[:n])
+                partial.append(name)
+            else:
+                skipped.append(name)
+    model.load_state_dict(target)
+    return {'loaded': loaded, 'partial': partial, 'skipped': skipped}
+
+
+def _load_warm_start_checkpoint(args):
+    path = getattr(args, 'init_checkpoint_path', None)
+    run_id = getattr(args, 'init_from_run_id', None)
+    if path:
+        print(f"Warm-starting from local checkpoint: {path}")
+        return torch.load(path, map_location='cpu', weights_only=True)
+    if run_id:
+        artifact = get_latest_checkpoint_artifact(args, run_id=run_id)
+        artifact_dir = artifact.download()
+        print(f"Warm-starting from W&B run: {run_id}")
+        return torch.load(os.path.join(artifact_dir, 'best_checkpoint.pt'),
+                          map_location='cpu', weights_only=True)
+    return None
+
+
 def get_checkpoint(args, sample_only):
     # Locate and read the checkpoint FIRST, so the model is built with the exact
     # architecture it was trained with (prevents train/inference arch mismatches).
     checkpoint, from_wandb = None, False
     if args.load_from_run_id or sample_only:
         if os.path.exists(args.local_checkpoint_path):
-            checkpoint = torch.load(args.local_checkpoint_path, weights_only=True)
+            checkpoint = torch.load(args.local_checkpoint_path, map_location='cpu',
+                                    weights_only=True)
             print(f"Loaded checkpoint from local path: {args.local_checkpoint_path}")
         elif args.load_from_run_id:
             artifact = get_latest_checkpoint_artifact(args)
             artifact_dir = artifact.download()
-            checkpoint = torch.load(os.path.join(artifact_dir, "best_checkpoint.pt"), weights_only=True)
+            checkpoint = torch.load(os.path.join(artifact_dir, "best_checkpoint.pt"),
+                                    map_location='cpu', weights_only=True)
             from_wandb = True
         else:
             print("No local model or W&B run ID provided. Exiting.")
@@ -195,6 +261,15 @@ def get_checkpoint(args, sample_only):
     model = MatFormer(args)
     model.to(args.device)
     print(f"Model #params: {sum(p.numel() for p in model.parameters())}")
+
+    if checkpoint is None and not sample_only:
+        warm_start = _load_warm_start_checkpoint(args)
+        if warm_start is not None:
+            source = warm_start.get('ema_state_dict') or warm_start['model_state_dict']
+            summary = load_compatible_weights(model, source)
+            print("Warm-started weights: "
+                  f"{len(summary['loaded'])} exact, {len(summary['partial'])} partial, "
+                  f"{len(summary['skipped'])} skipped")
 
     if not sample_only:
         optimizer = configure_optimizer(model, args)
@@ -228,11 +303,12 @@ def get_checkpoint(args, sample_only):
 
 
 
-def get_latest_checkpoint_artifact(args, verbose=True):
-    run = wandb.Api().run(f"{args.wandb_entity}/{args.wandb_project}/{args.load_from_run_id}")
+def get_latest_checkpoint_artifact(args, verbose=True, run_id=None):
+    run_id = run_id or args.load_from_run_id
+    run = wandb.Api().run(f"{args.wandb_entity}/{args.wandb_project}/{run_id}")
 
     if verbose:
-        print(f"Finding latest checkpoint for W&B run id {args.load_from_run_id}")
+        print(f"Finding latest checkpoint for W&B run id {run_id}")
     latest_artifact = None
     get_version = lambda artifact: -1 if artifact is None else int(artifact.name.split(':v')[-1])
     for artifact in run.logged_artifacts():
@@ -291,11 +367,11 @@ def build_rope_cache(seq_len, head_dim, device, dtype, base=10000.0):
     return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
-def apply_rope(x, cos, sin):
+def apply_rope(x, cos, sin, offset=0):
     """Apply rotary embeddings to a (B, n_head, T, head_dim) tensor."""
     T = x.size(-2)
-    cos = cos[:T].view(1, 1, T, -1)
-    sin = sin[:T].view(1, 1, T, -1)
+    cos = cos[offset:offset + T].view(1, 1, T, -1)
+    sin = sin[offset:offset + T].view(1, 1, T, -1)
     x1, x2 = x.chunk(2, dim=-1)
     rotated = torch.cat((-x2, x1), dim=-1)
     return x * cos + rotated * sin
@@ -319,7 +395,7 @@ class CausalSelfAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x, rope):
+    def forward(self, x, rope, kv_cache=None, use_cache=False):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
@@ -329,14 +405,28 @@ class CausalSelfAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         cos, sin = rope
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        past_len = 0 if kv_cache is None else kv_cache[0].size(-2)
+        q = apply_rope(q, cos, sin, past_len)
+        k = apply_rope(k, cos, sin, past_len)
+
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat((past_k, k), dim=-2)
+            v = torch.cat((past_v, v), dim=-2)
 
         # No dropout inside SDPA: dropout_p > 0 can force a fallback off the fused
         # FlashAttention kernel on some builds. Regularization comes from resid_drop.
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_mask = None
+        is_causal = kv_cache is None and T > 1
+        if kv_cache is not None and T > 1:
+            q_pos = torch.arange(T, device=x.device).unsqueeze(1) + past_len
+            k_pos = torch.arange(past_len + T, device=x.device).unsqueeze(0)
+            attn_mask = (k_pos <= q_pos).view(1, 1, T, past_len + T)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                           is_causal=is_causal)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_drop(self.c_proj(y))
+        y = self.resid_drop(self.c_proj(y))
+        return (y, (k, v)) if use_cache else y
 
 
 class CrossAttention(nn.Module):
@@ -507,15 +597,20 @@ class Block(nn.Module):
         self.ln_3 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x, rope, context=None, context_mask=None):
-        x = x + self.attn(self.ln_1(x), rope)
+    def forward(self, x, rope, context=None, context_mask=None,
+                kv_cache=None, use_cache=False):
+        attn_out = self.attn(self.ln_1(x), rope, kv_cache=kv_cache,
+                             use_cache=use_cache)
+        if use_cache:
+            attn_out, new_cache = attn_out
+        x = x + attn_out
 
         if self.has_cross_attn:
             assert context is not None, 'Expected context'
             x = x + self.cross_attn(self.ln_2(x), context, context_mask)
 
         x = x + self.mlp(self.ln_3(x))
-        return x
+        return (x, new_cache) if use_cache else x
 
 
 class Transformer(nn.Module):
@@ -544,8 +639,9 @@ class Transformer(nn.Module):
         self.use_style = getattr(config, 'style_words', 0) > 0
         if self.use_style:  # few-shot style adaptation from reference strokes
             self.transformer['style_enc'] = StyleEncoder(config)
-        # The stroke-stream PAD token is always vocab_size - 3 (PAD, END, WORD tail).
-        self.stroke_pad_token = getattr(config, 'stroke_pad_token', config.vocab_size - 3)
+        n_special = 4 if getattr(config, 'use_bos', False) else 3
+        self.stroke_pad_token = getattr(config, 'stroke_pad_token',
+                                        config.vocab_size - n_special)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight  # weight tying
 
@@ -581,42 +677,72 @@ class Transformer(nn.Module):
             self._rope_len = length
         return self._rope_cache
 
-    def forward(self, idx, context, targets=None, style=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-
-        x = self.transformer.wte(idx)  # (b, t, n_embd); positions handled by RoPE
-
+    def encode_conditioning(self, context, style=None):
+        """Encode text/style once so cached decoding does not repeat this work."""
+        device = context.device
         context_t = context.size(-1)
-        context_pos = torch.arange(0, context_t, dtype=torch.long, device=device).unsqueeze(0)
+        context_pos = torch.arange(0, context_t, dtype=torch.long,
+                                   device=device).unsqueeze(0)
         c = self.transformer.wce(context) + self.transformer.wcpe(context_pos)
-        context_mask = (context != self.context_pad_token)  # (b, t_ctx) True = real char
+        context_mask = (context != self.context_pad_token)
         if 'henc' in self.transformer:
             for eblock in self.transformer.henc:
                 c = eblock(c, context_mask)
             c = self.transformer.ln_enc(c)
 
-        # Few-shot style adaptation: pool the reference strokes into style memory
-        # tokens and append them to the cross-attention context (masked per row).
         if self.use_style and style is not None and style.numel() > 0:
             style = style[:, :self.transformer.style_enc.spe.num_embeddings]
             style_key_mask = (style != self.stroke_pad_token)
-            s_tokens, s_mask = self.transformer.style_enc(self.transformer.wte(style), style_key_mask)
+            s_tokens, s_mask = self.transformer.style_enc(
+                self.transformer.wte(style), style_key_mask)
             c = torch.cat([c, s_tokens], dim=1)
             context_mask = torch.cat([context_mask, s_mask], dim=1)
+        return c, context_mask
 
-        rope = self._get_rope(t, device, x.dtype)
-        for block in self.transformer.h:
-            x = block(x, rope, c, context_mask)
+    def forward(self, idx, context, targets=None, style=None, kv_cache=None,
+                use_cache=False, conditioning=None):
+        device = idx.device
+        b, t = idx.size()
+        past_len = 0 if not kv_cache else kv_cache[0][0].size(-2)
+        total_len = past_len + t
+        assert total_len <= self.block_size, \
+            f"Cannot forward sequence of length {total_len}, block size is only {self.block_size}"
+
+        x = self.transformer.wte(idx)  # (b, t, n_embd); positions handled by RoPE
+        c, context_mask = conditioning if conditioning is not None \
+            else self.encode_conditioning(context, style)
+
+        rope = self._get_rope(total_len, device, x.dtype)
+        new_cache = [] if use_cache else None
+        for layer_idx, block in enumerate(self.transformer.h):
+            layer_cache = None if not kv_cache else kv_cache[layer_idx]
+            if use_cache:
+                x, updated = block(x, rope, c, context_mask,
+                                   kv_cache=layer_cache, use_cache=True)
+                new_cache.append(updated)
+            else:
+                x = block(x, rope, c, context_mask)
 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # Callers may trim padded columns with a non-contiguous slice.
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   targets.reshape(-1), ignore_index=-1)
+        if use_cache:
+            return logits, loss, new_cache, (c, context_mask)
         return logits, loss
+
+    def forward_cached(self, idx, context, style=None, cache=None):
+        """Decode a prefix or one continuation token using an exact per-layer KV cache."""
+        kv_cache = None if cache is None else cache['kv']
+        conditioning = None if cache is None else cache['conditioning']
+        logits, _, new_cache, conditioning = self.forward(
+            idx, context, style=style, kv_cache=kv_cache, use_cache=True,
+            conditioning=conditioning)
+        return logits, {'kv': new_cache, 'conditioning': conditioning}
 
 
 class ModifiedMLP(MLP):

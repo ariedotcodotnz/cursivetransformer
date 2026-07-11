@@ -238,3 +238,111 @@ Replace dated `makemore`/GPT-2-isms with current standard transformer components
   (2) decode_stroke drops empty word groups; (3) regeneration no longer reseeds, so
   each rerun is a fresh attempt (fresh generation still seeds from params.seed).
   Files: sample.py, data.py.
+
+## 9. V5 approved workflow (2026-07-11)
+
+The next retrain is a two-stage **warm-started SFT + rendering-aware RLOO** run. This
+adapts the useful part of RLRF (score free-running renders, not only teacher-forced
+tokens) to the project's single-A100 budget. Full GRPO with tens of rollouts per prompt
+is not justified until a small pilot establishes that the reward and policy update are
+healthy.
+
+### Stage 0: credential hygiene
+
+- Rotate the W&B API key that appeared in earlier run configs.
+- Authenticate with `wandb login` or `WANDB_API_KEY`; never include the secret in CLI
+  arguments or `wandb.init(config=...)`.
+- Training config is sanitized before upload, so `wandb_api_key` cannot be persisted in
+  new run metadata.
+
+### Stage 1: v5 supervised training
+
+- Warm-start compatible backbone tensors from the best checkpoint of v3 run
+  `bxf7fmpq` with `--init_from_run_id bxf7fmpq`. This starts a fresh optimizer,
+  scheduler, step counter, and W&B run; it is not a resume.
+- Enable `--use_bos`. The new BOS embedding/output row is initialized separately and
+  makes prompt-only generation possible without leaking target stroke prefixes.
+- Use a conservative `--learning_rate 1e-3` for the pretrained backbone and train the
+  new style modules at `--style_lr_multiplier 3` (effective LR `3e-3`). Keep style
+  CFG, text CFG, EMA, structured generation, and full MatFormer capacity.
+- Cap the run at roughly 20k steps. Run full deterministic validation every 2k steps
+  and early-stop after three non-improving validations (`min_delta=0.001`).
+- Log token-weighted correct-style, no-style, and shuffled-style losses on the exact
+  same validation examples and augmentations. The two style gains must be positive;
+  ordinary test loss alone is not evidence of useful style control.
+
+Reference SFT flags:
+
+```text
+--use_bos --init_from_run_id bxf7fmpq --style_lr_multiplier 3
+--learning_rate 1e-3
+--max_steps 20000 --log_every 2000
+--eval_batch_size 100 --eval_max_batches -1
+--early_stopping_patience 3 --early_stopping_min_delta 0.001
+```
+
+### Stage 2: rendering-aware RLOO pilot
+
+- Initialize from the best v5 SFT **EMA** checkpoint and retain a supervised
+  cross-entropy anchor to prevent syntax/text collapse.
+- Generate four online rollouts per conditioning example at temperature 1.0. Begin
+  with one- or two-word prompts and no CFG inside policy sampling.
+- Use leave-one-out advantages within each rollout group. A learned critic and PPO
+  snapshot are unnecessary for this first, low-cost experiment.
+- Use KV-cached decoding for rollout throughput. Cache and non-cache generation must
+  remain token-equivalent under greedy decoding.
+- Run 200 updates first. Only extend toward 1k-1.5k updates if held-out render metrics
+  improve without reward hacking or degraded text/style controls.
+
+Reference pilot command (the parser uses hyphenated flags):
+
+```text
+python rl_train.py --sft-run-id <v5-sft-run-id> --max-updates 200 \
+  --conditions-batch-size 4 --rollouts-per-condition 4 --temperature 1.0 \
+  --rl-learning-rate 1e-4 --lr-total-updates 1500 --sft-coef 0.25 --num-words 2 \
+  --wandb-run-name modern_v5_rloo_pilot
+```
+
+The pilot saves `rl_last_checkpoint.pt` every 50 updates/final and the best held-out
+EMA policy to `rl_best_checkpoint.pt`. After review, resume optimizer/scheduler/EMA state
+with the same SFT source, `--resume-rl-checkpoint rl_last_checkpoint.pt`, and
+`--max-updates 1500` (a total-update target, not 1,500 additional updates).
+Keep `--lr-total-updates 1500` unchanged in both commands so the cosine schedule is
+continuous across the pilot boundary.
+An update-zero SFT evaluation seeds the best checkpoint, so RL replaces it only after a
+held-out reward improvement. W&B uploads the best artifact under the canonical payload
+name `best_checkpoint.pt` for compatibility with the existing run loader.
+
+### Fixed-canvas composite reward
+
+The raster transform is fitted from the target only and reused unchanged for every
+prediction. This prevents predictions from improving their score through autoscaling
+or tiny bounds. Log every component separately:
+
+- multiscale blurred-ink overlap plus distance-transform shape similarity;
+- slant, aspect ratio, curvature, stroke density, and pen-lift style agreement;
+- expected word count, explicit END, alternating theta/radius grammar, nonblank ink,
+  finite/bounded coordinates, and in-canvas coverage;
+- a two-sided token-length band with a low initial weight, so both bloated and collapsed
+  sequences are penalized without rewarding continual shortening;
+- hard failure ceilings for blank, malformed, truncated, extremely short, or mostly
+  out-of-bounds generations.
+
+Before policy optimization, inspect best/median/worst candidates and verify that reward
+ordering matches visible quality. W&B should log target/reference renders, candidate
+grids, total reward, every component, completion/END/validity rates, token length, and
+out-of-bounds/blank failure rates.
+
+### Go/no-go criteria
+
+Select the best checkpoint by held-out rendered reward, subject to all of the following:
+
+- correct-style validation is better than both no-style and shuffled-style validation;
+- word-completion and valid-END rates exceed v4;
+- fixed-canvas ink/shape similarity improves without a material token-NLL regression;
+- blank, short-output, malformed, truncated, and out-of-bounds rates do not rise;
+- reward-ranked candidate grids agree with human visual inspection.
+
+The current single-writer corpus can improve geometric style, spelling, completion, and
+stroke fidelity. Genuine unseen-writer identity cloning still requires a multi-writer
+corpus with target/reference examples sampled from the same writer.

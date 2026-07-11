@@ -14,19 +14,61 @@ Training a transformer to generate cursive with handwriting. By Sam Greydanus an
 
 ## Quickstart (Google Colab terminal with an A100 GPU)
 
-Uses [this](https://wandb.ai/sam-greydanus/bigbank_2k?nw=nwusersamgreydanus) W&B project.
+Uses [Weights & Biases](https://wandb.ai/) for run tracking and checkpoint artifacts.
 
-Clone `cursivetransformer` repo
-* `git clone https://github.com/greydanus/cursivetransformer.git && cd cursivetransformer && pip install wandb`
+> **Security:** older run configs may contain a `wandb_api_key` value. Rotate that key
+> before the next run, then authenticate with `wandb login` or the `WANDB_API_KEY`
+> environment variable. Do not pass the key through `--wandb_api_key`; the current
+> training scripts deliberately exclude credentials from uploaded W&B config.
 
-Train
-* `python train.py --wandb_entity sam-greydanus --wandb_project {your-wandb-project} --wandb_api_key {your-wandb-api-key} --dataset_name bigbank_3500 --batch_size 32 --max_seq_length 1050 --num_words 4 --step_lr_every 20000 --lr_decay 0.5 --learning_rate 1e-2 --n_layer 5 --max_steps 125000 --train_size 497000 --test_size 3000 --log_every 2500 --downsample_mean 0.65 --seed 1337`
-* Optionally add ` --load_from_run_id 7coqq2c4` to load saved model and optimizer parameters and resume training from best checkpoint.
-* For the paper, we just opened the terminal view in the [Google Colab](https://colab.research.google.com/github/greydanus/cursivetransformer/blob/main/train_sample_visualize.ipynb) and ran the training script for a few hours. The cost is just a few dollars worth of Colab credits.
+Clone `cursivetransformer` repo and authenticate once:
 
-Sample
-* `python sample.py --wandb_entity sam-greydanus --wandb_project {your-wandb-project} --wandb_api_key {your-wandb-api-key} --dataset_name bigbank --batch_size 32 --max_seq_length 1050 --step_lr_every 25000 --lr_decay 0.5 --train_size 7000 --test_size 3000 --log_every 2500 --downsample_mean 0.65 --load_from_run_id 7fkxkoir`
-* Or use the sampling code in the [Colab notebook](https://colab.research.google.com/github/greydanus/cursivetransformer/blob/main/train_sample_visualize.ipynb) to make more sophisticated samples
+```bash
+git clone https://github.com/ariedotcodotnz/cursivetransformer.git
+cd cursivetransformer
+pip install -r requirements.txt
+wandb login
+```
+
+Train the v5 supervised model by warm-starting the proven v3 backbone. This starts a
+new run (it does not resume v3's optimizer or schedule), expands the vocabulary with a
+real BOS token, and initializes the style encoder separately at 3x the backbone LR:
+
+```bash
+python train.py \
+  --wandb_entity {your-wandb-entity} \
+  --wandb_project {your-wandb-project} \
+  --wandb_run_name modern_v5_sft \
+  --dataset_name bigbank_3500 \
+  --batch_size 64 --max_seq_length 1050 --num_words 4 \
+  --learning_rate 1e-3 --n_layer 5 --max_steps 20000 \
+  --train_size 497000 --test_size 3000 --log_every 2000 \
+  --downsample_mean 0.65 --dropout 0.1 --num_workers 8 \
+  --lr_schedule cosine --warmup_steps 1000 --grad_clip 1.0 \
+  --cond_drop_prob 0.1 --style_words 3 --style_drop_prob 0.1 \
+  --ema_decay 0.999 --subnetwork_mode full \
+  --use_bos --init_from_run_id bxf7fmpq --style_lr_multiplier 3 \
+  --eval_batch_size 100 --eval_max_batches -1 \
+  --early_stopping_patience 3 --early_stopping_min_delta 0.001 \
+  --local_checkpoint_path v5_sft_best.pt --seed 1337
+```
+
+`--load_from_run_id` means resume the same run, including optimizer, scheduler, and
+step. `--init_from_run_id` means warm-start compatible weights into a new run. These
+operations are intentionally different.
+
+Sample:
+
+```bash
+python sample.py \
+  --wandb_entity {your-wandb-entity} \
+  --wandb_project {your-wandb-project} \
+  --dataset_name bigbank_3500 \
+  --load_from_run_id {v5-run-id} --use_bos
+```
+
+The [Colab notebook](cursive_colab.ipynb) contains the complete two-stage v5 workflow
+and more sophisticated sampling examples.
 
 
 ## Making a dataset
@@ -78,6 +120,68 @@ is automatically preferred for sampling. With the current single-writer dataset,
 captures geometric style (slant, proportions, stroke density). The same conditioning path
 can support full writer-identity cloning with a multi-writer corpus (IAM/BRUSH), provided
 training targets and references are sampled within each writer.
+
+## V5: BOS generation and rendering-aware post-training
+
+V5 adapts the rendered-feedback idea from
+[RLRF](https://arxiv.org/abs/2505.20793) to this project's single-GPU scale and
+separates training into two measured stages:
+
+1. **Warm-started SFT.** `--use_bos` teaches generation from an explicit beginning
+   token, eliminating the old dependency on ground-truth stroke prefixes. Compatible
+   backbone weights come from v3 run `bxf7fmpq`; the new BOS row and style modules are
+   initialized normally. Validation is deterministic and logs
+   `test_loss_style_correct`, `test_loss_no_style`, and
+   `test_loss_shuffled_style`. A useful style encoder should make correct-reference
+   loss lower than both controls.
+2. **Rendering-aware RLOO.** Starting from the best SFT EMA checkpoint, sample four
+   full handwriting rollouts for each prompt and optimize leave-one-out relative
+   advantages plus an SFT anchor. The fixed-canvas reward compares rendered ink and
+   shape, style statistics, word completion, END/grammar validity, bounds, and a
+   two-sided length band. Blank, malformed, truncated, very short, or out-of-bounds
+   outputs receive hard penalties.
+
+The first RL run is deliberately a **200-update pilot**. Extend it only when held-out
+render reward improves, correct style beats shuffled/no-style controls, and blank,
+truncated, malformed, short-output, and out-of-bounds rates remain controlled. KV-cache
+decoding keeps autoregressive rollouts practical; it changes inference cost, not the
+model's learned distribution.
+
+Launch the pilot from the best v5 SFT artifact:
+
+```bash
+python rl_train.py \
+  --sft-run-id {v5-sft-run-id} \
+  --max-updates 200 \
+  --conditions-batch-size 4 --rollouts-per-condition 4 \
+  --temperature 1.0 --rl-learning-rate 1e-4 --lr-total-updates 1500 \
+  --sft-coef 0.25 \
+  --num-words 2 --eval-every 50 --eval-ablation-rollouts 1 \
+  --wandb-entity cursivetransformer-ng \
+  --wandb-project cursivetransformer-ng \
+  --wandb-run-name modern_v5_rloo_pilot
+```
+
+Use `--sft-checkpoint-path v5_sft_best.pt` instead when the SFT checkpoint is local.
+The pilot writes the best held-out EMA policy to `rl_best_checkpoint.pt` and resumable
+optimizer/EMA state to `rl_last_checkpoint.pt`. After the go/no-go review, continue the
+same run and state with:
+
+```bash
+python rl_train.py \
+  --sft-run-id {v5-sft-run-id} \
+  --resume-rl-checkpoint rl_last_checkpoint.pt \
+  --max-updates 1500 \
+  --lr-total-updates 1500 \
+  --wandb-run-id {pilot-run-id} \
+  --wandb-entity cursivetransformer-ng \
+  --wandb-project cursivetransformer-ng
+```
+
+RLOO evaluates and saves the update-zero SFT baseline before optimizing, so the best
+checkpoint is replaced only by a policy with higher held-out render reward. W&B stores
+that artifact payload as `best_checkpoint.pt`, keeping `sample.py --load_from_run_id`
+compatible; use `--local_checkpoint_path rl_best_checkpoint.pt` for the local file.
 
 ## Training and logging
 
@@ -242,7 +346,7 @@ Increased dataset size from 1.9k to 2.3k. Started a 200k step run with stepwise 
 
 Moved all core code into a hacky 800-line script. Also moved the full dataset into a 2.5 MB zip file which I added to the git repo. Now the repo can be cloned and a training run started in one line of bash, so long as you have a Weights and Biases username/api key. This makes starting longer runs outside of the Colab environment much easier. Next step is to launch a longer run on a good GPU, potentially via Paperspace. Here's the one-liner:
 
-`git clone https://github.com/greydanus/cursivetransformer.git && cd cursivetransformer && pip install -r requirements.txt && python train.py --wandb_entity {your-wandb-username} --wandb_project {wandb-project-name} --wandb_api_key {your-wandb-api-key}`
+`git clone https://github.com/greydanus/cursivetransformer.git && cd cursivetransformer && pip install -r requirements.txt && wandb login && python train.py --wandb_entity {your-wandb-username} --wandb_project {wandb-project-name}`
 
 Here are samples generated after 180k gradient steps:
 

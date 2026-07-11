@@ -108,6 +108,9 @@ def _structured_mask(idx, dataset):
     only_word[dataset.WORD_TOKEN] = True
     valid[last_is_w & ~prev_is_w] = only_word
     valid[last_is_w & prev_is_w] = theta_tok
+    bos_token = getattr(dataset, 'BOS_TOKEN', None)
+    if bos_token is not None:
+        valid[idx[:, -1] == bos_token] = theta_tok
     return valid
 
 
@@ -129,10 +132,10 @@ def _filter_logits(logits, temperature, top_k, top_p):
 @torch.no_grad()
 def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=False,
              top_k=None, top_p=None, guidance_scale=1.0, structured=False, dataset=None,
-             style=None, style_guidance_scale=1.0):
+             style=None, style_guidance_scale=1.0, use_cache=True):
     """
     Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-    the sequence max_new_tokens times, feeding the predictions back into the model each time.
+    it to ``max_new_tokens`` total tokens, feeding predictions back into the model.
     Supports nucleus sampling (top_p), classifier-free guidance (guidance_scale > 1), and
     structured masking that forbids tokens which would break the (theta, r) pairing.
     `style` is an optional (b or 1, Ls) style-reference token tensor; compositional CFG
@@ -162,6 +165,22 @@ def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=Fal
 
     block_size = model.get_block_size()
     steps = max(0, max_new_tokens-idx.size(1))
+    cached = use_cache and hasattr(model, 'forward_cached')
+    branch_caches = {}
+
+    def branch_logits(name, branch_context, branch_style=None):
+        if not cached:
+            if branch_style is None:
+                out, _ = model(idx_cond, branch_context)
+            else:
+                out, _ = model(idx_cond, branch_context, style=branch_style)
+            return out[:, -1, :]
+        cache = branch_caches.get(name)
+        tokens = idx_cond if cache is None else idx[:, -1:]
+        out, branch_caches[name] = model.forward_cached(
+            tokens, branch_context, style=branch_style, cache=cache)
+        return out[:, -1, :]
+
     for i in range(steps):
         if end_token is not None and bool(finished.all()):
             pad_fill = torch.full((idx.size(0), steps - i), pad_token,
@@ -170,21 +189,22 @@ def generate(model, idx, context, max_new_tokens, temperature=1.0, do_sample=Fal
             break
         # if the sequence context is growing too long we must crop it at block_size
         idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
+        if cached and branch_caches:
+            cache_len = next(iter(branch_caches.values()))['kv'][0][0].size(-2)
+            if cache_len >= block_size:
+                branch_caches.clear()
         # forward the model to get the logits for the index in the sequence
-        logits, _ = model(idx_cond, context, style=style) if use_style else model(idx_cond, context)
-        logits = logits[:, -1, :]  # text (+ style) conditioned
+        logits = branch_logits('conditioned', context, style if use_style else None)
 
         if use_style_cfg or (use_style and use_cfg):
             # text-only logits anchor the style guidance term (and the text term below)
-            text_logits, _ = model(idx_cond, context)
-            text_logits = text_logits[:, -1, :]
+            text_logits = branch_logits('text', context)
             logits = text_logits + g_style * (logits - text_logits)
         else:
             text_logits = logits if not use_style else None
 
         if use_cfg:  # extrapolate away from the unconditional distribution
-            uncond_logits, _ = model(idx_cond, null_context)
-            uncond_logits = uncond_logits[:, -1, :]
+            uncond_logits = branch_logits('unconditional', null_context)
             anchor = text_logits if text_logits is not None else logits
             logits = logits + (g_text - 1.0) * (anchor - uncond_logits)
 
@@ -220,11 +240,15 @@ def save_samples(model, dataset, num=2, model_device='cpu', warmup_steps=50, do_
       x, c, y, s = dataset[i]
       stroke_seq.append(x) ; context.append(c) ; styles.append(s)
 
-    X_init = torch.stack(stroke_seq).to(model_device)[:,:warmup_steps]
+    if getattr(dataset, 'use_bos', False):
+        X_init = dataset.get_generation_prefix().to(model_device).unsqueeze(0)
+        X_init = X_init.expand(num, -1)
+    else:
+        X_init = torch.stack(stroke_seq).to(model_device)[:, :warmup_steps]
     context = torch.stack(context).long().to(model_device)
     style = torch.stack(styles).long().to(model_device)
     style = style if style.numel() else None
-    steps = dataset.get_stroke_seq_length() - 1  # -1 because we already start with the first token
+    steps = dataset.get_stroke_seq_length()  # generate() interprets this as total length
 
     X_samp = generate(model, X_init, context, steps, temperature=params.temperature,
                       top_k=params.top_k, top_p=params.top_p, guidance_scale=params.guidance_scale,
@@ -253,19 +277,7 @@ def save_samples(model, dataset, num=2, model_device='cpu', warmup_steps=50, do_
 
 def generate_helper_fn(model, dataset, word_list, params, style=None):
     model_device = next(model.parameters()).device
-    warmup_sample_ix = params.warmup_sample_ix if params.warmup_sample_ix else torch.randint(len(dataset), (1,)).item()
-    if params.verbose: print(f' (warmup_sample_ix={warmup_sample_ix})')
 
-    seed_x, seed_c = dataset[warmup_sample_ix][:2]  # Get seed tokens and text from dataset
-    word_tokens = dataset.split_by_word_tokens(seed_x)  # Get just first word tokens
-    first_word_tokens = torch.tensor(word_tokens[0])
-    first_word_tokens = torch.cat([first_word_tokens, torch.tensor([dataset.WORD_TOKEN])])  # Add word token
-    warmup_steps = len(first_word_tokens)
-    
-    # Get just the first word from the context
-    seed_text = dataset.decode_text(seed_c)
-    first_word = seed_text.split()[0]
-    
     def trunc_or_pad_words(word_list, dataset, params):
         n = len(word_list) ; n_words = params.n_words
         if n < n_words:  # Sample random words from the dataset's vocabulary
@@ -277,19 +289,41 @@ def generate_helper_fn(model, dataset, word_list, params, style=None):
             return word_list + padding_words
         return word_list
 
-    word_list = trunc_or_pad_words(word_list, dataset, params)
-    text = ' '.join(word_list)
-    ascii_context = f'{first_word} {text}'
+    if getattr(dataset, 'use_bos', False):
+        # V5 learned a true start distribution; no unrelated handwriting/text prefix.
+        text = ' '.join(word_list)
+        ascii_context = text
+        X_init = dataset.get_generation_prefix().unsqueeze(0).to(model_device)
+        warmup_steps = X_init.size(1)
+        if params.verbose:
+            print(' (BOS)')
+    else:
+        warmup_sample_ix = params.warmup_sample_ix if params.warmup_sample_ix is not None \
+            else torch.randint(len(dataset), (1,)).item()
+        if params.verbose:
+            print(f' (warmup_sample_ix={warmup_sample_ix})')
+        seed_x, seed_c = dataset[warmup_sample_ix][:2]
+        word_tokens = dataset.split_by_word_tokens(seed_x)
+        first_word_tokens = torch.tensor(word_tokens[0])
+        first_word_tokens = torch.cat(
+            [first_word_tokens, torch.tensor([dataset.WORD_TOKEN])])
+        warmup_steps = len(first_word_tokens)
+        seed_text = dataset.decode_text(seed_c)
+        first_word = seed_text.split()[0]
+        word_list = trunc_or_pad_words(word_list, dataset, params)
+        text = ' '.join(word_list)
+        ascii_context = f'{first_word} {text}'
+        X_init = first_word_tokens.unsqueeze(0).to(model_device)
 
     context = dataset.encode_text(ascii_context).unsqueeze(0)
     context = context.to(model_device)
-    X_init = first_word_tokens.unsqueeze(0).to(model_device)
 
     if style is not None:
         style = style.to(model_device)
 
-    steps = params.num_steps - X_init.size(1)
-    X_samp = generate(model, X_init, context, steps, temperature=params.temperature,
+    # generate() takes the desired total sequence length, including the prefix.
+    X_samp = generate(model, X_init, context, params.num_steps,
+                      temperature=params.temperature,
                       top_k=params.top_k, top_p=params.top_p, guidance_scale=params.guidance_scale,
                       structured=params.structured, dataset=dataset, do_sample=params.do_sample,
                       style=style, style_guidance_scale=params.style_guidance_scale).to('cpu')
@@ -411,9 +445,19 @@ if __name__ == '__main__':
     args.context_block_size = train_dataset.get_text_seq_length()
     args.vocab_size = train_dataset.get_vocab_size()
     args.context_vocab_size = train_dataset.get_char_vocab_size()
+    args.stroke_pad_token = train_dataset.PAD_TOKEN
     print(f"Dataset determined that: {args.vocab_size=}, {args.block_size=}")
 
     model, optimizer, scheduler, step, best_loss, _ = get_checkpoint(args, sample_only=True)
+    if train_dataset.get_vocab_size() != model.config.vocab_size:
+        raise ValueError(
+            'Dataset/checkpoint vocabulary mismatch. For a v5 checkpoint, include '
+            '`--use_bos`; for a legacy checkpoint, omit it.'
+        )
+    if train_dataset.get_stroke_seq_length() != model.config.block_size:
+        raise ValueError('Dataset/checkpoint stroke sequence lengths do not match')
+    if train_dataset.get_text_seq_length() != model.config.context_block_size:
+        raise ValueError('Dataset/checkpoint text context lengths do not match')
     model.eval()
 
     if getattr(args, 'style_json', None):
